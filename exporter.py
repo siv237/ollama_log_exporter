@@ -68,18 +68,17 @@ def parse_log_line(line):
             'model': last_seen_model
         }
 
-    # Затем парсим логи конфигурации
-    if 'msg="server config"' in line:
-        num_parallel_match = re.search(r'OLLAMA_NUM_PARALLEL:(\d+)', line)
-        max_loaded_match = re.search(r'OLLAMA_MAX_LOADED_MODELS:(\d+)', line)
+    # Затем парсим логи конфигурации из строки 'inference compute'
+    if 'msg="inference compute"' in line:
+        num_parallel_match = re.search(r'parallel=(\d+)', line)
+        # max_loaded_models в этой строке нет, оставляем unknown
         
         num_parallel = num_parallel_match.group(1) if num_parallel_match else 'unknown'
-        max_loaded_models = max_loaded_match.group(1) if max_loaded_match else 'unknown'
         
         OLLAMA_INFO.labels(
-            version='unknown',
+            version='unknown', # версия также отсутствует
             num_parallel=num_parallel,
-            max_loaded_models=max_loaded_models
+            max_loaded_models='unknown'
         ).set(1)
         return None
 
