@@ -11,7 +11,7 @@ import argparse
 def parse_log_line(line):
     # Пример: [GIN] 2025/07/12 - 09:27:25 | 500 | 59.654288737s | 127.0.0.1 | POST     "/api/generate"
     pattern = re.compile(
-        r'^\[GIN\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})\s+\|\s+(\d{3})\s+\|\s+([\d\.smµ]+)\s+\|\s+([\d\.]+)\s+\|\s+(\w+)\s+"([^"\s]+)"'
+        r'^\[GIN\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})\s+\|\s+(\d{3})\s+\|\s+([\dm\.sµ]+)\s+\|\s+([\d\.]+)\s+\|\s+(\w+)\s+"([^"\s]+)"'
     )
     m = pattern.match(line)
     if not m:
@@ -27,15 +27,21 @@ def parse_log_line(line):
     }
 
 def duration_to_seconds(duration):
-    # Преобразует строку вроде '59.654288737s' или '74.582µs' в float секунд
+    # Преобразует строку вроде '1m22s', '59.6s' или '74.5µs' в float секунд
+    total_seconds = 0.0
+    if 'm' in duration:
+        parts = duration.split('m')
+        total_seconds += float(parts[0]) * 60
+        duration = parts[1]
+
     if duration.endswith('s'):
-        return float(duration[:-1])
+        total_seconds += float(duration[:-1])
     elif duration.endswith('ms'):
-        return float(duration[:-2]) / 1000
+        total_seconds += float(duration[:-2]) / 1000
     elif duration.endswith('µs') or duration.endswith('us'):
-        return float(duration[:-2]) / 1_000_000
-    else:
-        return 0.0
+        total_seconds += float(duration[:-2]) / 1_000_000
+    
+    return total_seconds
 
 def journalctl_follow(unit):
     # Читает логи из journalctl -u ollama -f
