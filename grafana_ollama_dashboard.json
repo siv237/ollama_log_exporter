@@ -1,0 +1,93 @@
+{
+  "__inputs": [],
+  "__requires": [
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "*"},
+    {"type": "panel", "id": "graph", "name": "Graph", "version": "*"},
+    {"type": "panel", "id": "stat", "name": "Stat", "version": "*"},
+    {"type": "panel", "id": "table", "name": "Table", "version": "*"}
+  ],
+  "annotations": {"list": []},
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "iteration": 1620000000000,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "expr": "sum by (endpoint, method, status) (rate(ollama_requests_total[5m]))",
+          "legendFormat": "{{endpoint}} {{method}} {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Количество запросов к Ollama",
+      "type": "graph"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(ollama_request_errors_total[5m]))",
+          "legendFormat": "Ошибка {{status}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Ошибки Ollama (4xx, 5xx)",
+      "type": "graph"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "id": 3,
+      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ollama_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "95-й перцентиль",
+          "refId": "A"
+        }
+      ],
+      "title": "Время обработки запроса (latency, 95-й перцентиль)",
+      "type": "graph"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "id": 4,
+      "options": {"showHeader": true},
+      "targets": [
+        {
+          "expr": "sum by (ip, endpoint, method) (rate(ollama_requests_total[5m]))",
+          "legendFormat": "{{ip}} {{endpoint}} {{method}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Таблица активности по IP и endpoint",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 27,
+  "style": "dark",
+  "tags": ["ollama", "prometheus"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Ollama Log Exporter Dashboard",
+  "uid": "ollama-log-exporter",
+  "version": 1
+}
