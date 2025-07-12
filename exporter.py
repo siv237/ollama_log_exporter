@@ -4,15 +4,13 @@ Ollama Log Exporter for Prometheus
 Парсит логи Ollama и экспонирует реальные метрики использования моделей, пользователей и задержек работы Ollama.
 """
 import re
-import time
-from collections import defaultdict
+import subprocess
 from prometheus_client import start_http_server, Counter, Histogram
 import argparse
-import os
 
 def parse_log_line(line):
     # Пример: [GIN] 2025/07/12 - 09:27:25 | 500 | 59.654288737s | 127.0.0.1 | POST     "/api/generate"
-    pattern = re.compile(r"\\[GIN\\] (\\d{4}/\\d{2}/\\d{2}) - (\\d{2}:\\d{2}:\\d{2}) \\| (\\d{3}) \\| ([\\d.]+[a-z]+) \\| ([\\d.]+\\.[\\d.]+\\.[\\d.]+|[\\d.]+) \\| (\\w+) +\\"([^"]+)\\"")
+    pattern = re.compile(r'\[GIN\] (\d{4}/\d{2}/\d{2}) - (\d{2}:\d{2}:\d{2}) \| (\d{3}) \| ([\d\.]+[a-zµ]+) \| ([\d\.]+) \| (\w+)\s+"([^"]+)"')
     m = pattern.match(line)
     if not m:
         return None
@@ -37,20 +35,18 @@ def duration_to_seconds(duration):
     else:
         return 0.0
 
-def tail_f(filename):
-    with open(filename, 'r') as f:
-        f.seek(0, os.SEEK_END)
-        while True:
-            line = f.readline()
-            if not line:
-                time.sleep(0.2)
-                continue
-            yield line.rstrip('\n')
+def journalctl_follow(unit):
+    # Читает логи из journalctl -u ollama -f
+    p = subprocess.Popen([
+        "journalctl", "-u", unit, "-f", "-n", "0", "--output", "cat"
+    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    for line in p.stdout:
+        yield line.rstrip('\n')
 
 def main():
     parser = argparse.ArgumentParser(description='Ollama Log Exporter for Prometheus')
-    parser.add_argument('--log', type=str, required=True, help='Path to ollama log file')
     parser.add_argument('--port', type=int, default=9877, help='Port to expose metrics')
+    parser.add_argument('--unit', type=str, default='ollama', help='systemd unit name (default: ollama)')
     args = parser.parse_args()
 
     # Метрики
@@ -59,9 +55,9 @@ def main():
     DURATION_HIST = Histogram('ollama_request_duration_seconds', 'Request duration to Ollama', ['endpoint', 'method', 'ip'])
 
     start_http_server(args.port)
-    print(f"Exporter started on :{args.port}, tailing {args.log}")
+    print(f"Exporter started on :{args.port}, following journalctl -u {args.unit}")
 
-    for line in tail_f(args.log):
+    for line in journalctl_follow(args.unit):
         parsed = parse_log_line(line)
         if not parsed:
             continue
