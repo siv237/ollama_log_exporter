@@ -43,21 +43,29 @@ def parse_log_line(line):
     # 1. Парсер для информации о конфигурации
     # time=... msg="server config" OLLAMA_NUM_PARALLEL=1 ...
     if 'msg="server config"' in line:
-        params = dict(re.findall(r'(\w+)=([^\s]+)', line))
+        # Ищем параметры в строке 'env="map[... OLLAMA_NUM_PARALLEL:0 ...]"'
+        num_parallel_match = re.search(r'OLLAMA_NUM_PARALLEL:(\d+)', line)
+        max_loaded_match = re.search(r'OLLAMA_MAX_LOADED_MODELS:(\d+)', line)
+        
+        num_parallel = num_parallel_match.group(1) if num_parallel_match else 'unknown'
+        max_loaded_models = max_loaded_match.group(1) if max_loaded_match else 'unknown'
+        
+        # Версию пока не нашли в логах, оставляем 'unknown'
         OLLAMA_INFO.labels(
-            version=params.get('OLLAMA_VERSION', 'unknown'),
-            num_parallel=params.get('OLLAMA_NUM_PARALLEL', 'unknown'),
-            max_loaded_models=params.get('OLLAMA_MAX_LOADED_MODELS', 'unknown')
+            version='unknown',
+            num_parallel=num_parallel,
+            max_loaded_models=max_loaded_models
         ).set(1)
         return None
 
     # 2. Парсер для ID модели
     # time=... msg="starting llama server" path=.../sha256:12345...
     if 'msg="starting llama server"' in line:
-        match = re.search(r'sha256:([a-f0-9]{12})',
-                          line) # Ищем короткий хеш
+        # Ищем хэш в строке '...--model /usr/share/ollama/.ollama/models/blobs/sha256-...'
+        match = re.search(r'sha256-([a-f0-9]{64})', line)
         if match:
-            last_seen_model = f"sha256:{match.group(1)}"
+            # Сохраняем только первые 12 символов для читаемости
+            last_seen_model = f"sha256:{match.group(1)[:12]}"
         return None
 
     # 3. Парсер для GIN логов (запросы)
