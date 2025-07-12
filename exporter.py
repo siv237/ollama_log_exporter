@@ -5,7 +5,10 @@ Ollama Log Exporter for Prometheus
 """
 import re
 import subprocess
-from prometheus_client import start_http_server, Counter, Histogram, Gauge
+import time
+import requests
+import threading
+from prometheus_client import start_http_server, Counter, Gauge, Histogram
 import argparse
 
 # --- Глобальные переменные и метрики ---
@@ -33,6 +36,9 @@ REQUEST_DURATION = Histogram(
     'Request duration to Ollama',
     ['ip', 'endpoint', 'method', 'model']
 )
+
+# Словарь для сопоставления ID модели с ее именем
+model_map = {}
 
 # --- Функции парсинга ---
 
@@ -86,7 +92,7 @@ def parse_log_line(line):
     if 'msg="starting llama server"' in line:
         match = re.search(r'sha256-([a-f0-9]{64})', line)
         if match:
-            last_seen_model = f"sha256:{match.group(1)[:12]}"
+            last_seen_model = f"sha256:{match.group(1)}"
         return None
         
     return None
@@ -119,6 +125,43 @@ def journalctl_follow(unit):
         clean_line = re.sub(r'^.*?ollama\[\d+\]: ', '', line.strip())
         yield clean_line
 
+# --- Функции для работы с API Ollama ---
+
+def update_model_map():
+    """
+    Обновляет словарь model_map, запрашивая данные из Ollama API.
+    """
+    global model_map
+    try:
+        response = requests.get('http://localhost:11434/api/tags', timeout=10)
+        response.raise_for_status()
+        models = response.json().get('models', [])
+        
+        # Атомарно заменяем старый словарь на новый
+        new_map = {model['digest']: model['name'] for model in models}
+        model_map = new_map
+            
+        print(f"Model map updated. Found {len(model_map)} models.")
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error updating model map: {e}")
+
+def start_periodic_model_map_update(interval_seconds=300):
+    """
+    Запускает периодическое обновление model_map в фоновом потоке.
+    """
+    def updater_loop():
+        while True:
+            update_model_map()
+            time.sleep(interval_seconds)
+
+    # Первоначальное обновление перед запуском цикла
+    update_model_map()
+    
+    updater_thread = threading.Thread(target=updater_loop, daemon=True)
+    updater_thread.start()
+    print("Started periodic model map updater.")
+
 # --- Основная логика ---
 
 def main():
@@ -130,6 +173,9 @@ def main():
     start_http_server(args.port)
     print(f"Exporter started on :{args.port}, following journalctl -u {args.unit}")
 
+    # Запускаем фоновое обновление словаря моделей
+    start_periodic_model_map_update()
+
     for line in journalctl_follow(args.unit):
         data = parse_log_line(line)
         if not data:
@@ -137,19 +183,23 @@ def main():
 
         duration_sec = duration_to_seconds(data['duration'])
         
+        # Получаем имя модели из ID, если оно есть в словаре
+        model_id = data.get('model', 'unknown')
+        model_name = model_map.get(model_id, model_id)
+
         # Обновляем метрики
         labels = {
             'ip': data['ip'],
             'endpoint': data['endpoint'],
             'method': data['method'],
             'status': data['status'],
-            'model': data['model']
+            'model': model_name
         }
         duration_labels = {
             'ip': data['ip'],
             'endpoint': data['endpoint'],
             'method': data['method'],
-            'model': data['model']
+            'model': model_name
         }
 
         REQUESTS_TOTAL.labels(**labels).inc()
