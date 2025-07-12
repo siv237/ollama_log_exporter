@@ -5,79 +5,152 @@ Ollama Log Exporter for Prometheus
 """
 import re
 import subprocess
-from prometheus_client import start_http_server, Counter, Histogram
+from prometheus_client import start_http_server, Counter, Histogram, Gauge
 import argparse
 
+# --- Глобальные переменные и метрики ---
+# Эта переменная будет хранить ID последней загруженной модели между вызовами парсера
+last_seen_model = 'unknown'
+
+# Метрики объявляются здесь, чтобы быть доступными для всех функций
+OLLAMA_INFO = Gauge(
+    'ollama_info',
+    'Information about the Ollama instance',
+    ['version', 'num_parallel', 'max_loaded_models']
+)
+REQUESTS_TOTAL = Counter(
+    'ollama_requests_total',
+    'Total requests to Ollama',
+    ['ip', 'endpoint', 'method', 'status', 'model']
+)
+REQUEST_ERRORS_TOTAL = Counter(
+    'ollama_request_errors_total',
+    'Total error requests to Ollama',
+    ['ip', 'endpoint', 'method', 'status', 'model']
+)
+REQUEST_DURATION = Histogram(
+    'ollama_request_duration_seconds',
+    'Request duration to Ollama',
+    ['ip', 'endpoint', 'method', 'model']
+)
+
+# --- Функции парсинга ---
+
 def parse_log_line(line):
-    # Пример: [GIN] 2025/07/12 - 09:27:25 | 500 | 59.654288737s | 127.0.0.1 | POST     "/api/generate"
-    pattern = re.compile(
-        r'^\[GIN\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})\s+\|\s+(\d{3})\s+\|\s+([\dm\.sµ]+)\s+\|\s+([\d\.]+)\s+\|\s+(\w+)\s+"([^"\s]+)"'
-    )
-    m = pattern.match(line)
-    if not m:
+    """Анализирует одну строку лога и возвращает словарь с данными или None."""
+    global last_seen_model
+
+    # 1. Парсер для информации о конфигурации
+    # time=... msg="server config" OLLAMA_NUM_PARALLEL=1 ...
+    if 'msg="server config"' in line:
+        params = dict(re.findall(r'(\w+)=([^\s]+)', line))
+        OLLAMA_INFO.labels(
+            version=params.get('OLLAMA_VERSION', 'unknown'),
+            num_parallel=params.get('OLLAMA_NUM_PARALLEL', 'unknown'),
+            max_loaded_models=params.get('OLLAMA_MAX_LOADED_MODELS', 'unknown')
+        ).set(1)
         return None
-    date, t, status, duration, ip, method, endpoint = m.groups()
-    return {
-        'datetime': f"{date} {t}",
-        'status': status,
-        'duration': duration,
-        'ip': ip,
-        'method': method,
-        'endpoint': endpoint
-    }
+
+    # 2. Парсер для ID модели
+    # time=... msg="starting llama server" path=.../sha256:12345...
+    if 'msg="starting llama server"' in line:
+        match = re.search(r'sha256:([a-f0-9]{12})',
+                          line) # Ищем короткий хеш
+        if match:
+            last_seen_model = f"sha256:{match.group(1)}"
+        return None
+
+    # 3. Парсер для GIN логов (запросы)
+    # [GIN] 2025/07/12 - 09:27:25 | 500 | 59.6s | 127.0.0.1 | POST "/api/generate"
+    if line.startswith('[GIN]'):
+        parts = [p.strip() for p in line.split('|')]
+        if len(parts) < 5:
+            return None
+        
+        status = parts[1]
+        duration_str = parts[2]
+        ip = parts[3]
+        method_endpoint = parts[4].split()
+        method = method_endpoint[0]
+        endpoint = method_endpoint[1].strip('"')
+
+        return {
+            'status': status,
+            'duration': duration_str,
+            'ip': ip,
+            'method': method,
+            'endpoint': endpoint,
+            'model': last_seen_model
+        }
+
+    return None
 
 def duration_to_seconds(duration):
-    # Преобразует строку вроде '1m22s', '59.6s' или '74.5µs' в float секунд
+    """Преобразует строку вроде '1m22s', '59.6s' или '74.5µs' в float секунд."""
     total_seconds = 0.0
-    if 'm' in duration:
-        parts = duration.split('m')
-        total_seconds += float(parts[0]) * 60
-        duration = parts[1]
+    try:
+        if 'm' in duration:
+            parts = duration.split('m')
+            total_seconds += float(parts[0]) * 60
+            duration = parts[1]
 
-    if duration.endswith('s'):
-        total_seconds += float(duration[:-1])
-    elif duration.endswith('ms'):
-        total_seconds += float(duration[:-2]) / 1000
-    elif duration.endswith('µs') or duration.endswith('us'):
-        total_seconds += float(duration[:-2]) / 1_000_000
-    
+        if 's' in duration:
+            total_seconds += float(duration.replace('s', ''))
+        elif 'ms' in duration:
+            total_seconds += float(duration.replace('ms', '')) / 1000
+        elif 'µs' in duration or 'us' in duration:
+            total_seconds += float(duration.replace('µs', '').replace('us', '')) / 1_000_000
+    except (ValueError, IndexError):
+        return 0.0 # Возвращаем 0 если не смогли распарсить
     return total_seconds
 
 def journalctl_follow(unit):
-    # Читает логи из journalctl -u ollama -f
-    p = subprocess.Popen([
-        "journalctl", "-u", unit, "-f", "-n", "0", "--output", "cat"
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-    for line in p.stdout:
-        yield line.rstrip('\n')
+    """Читает и очищает логи из journalctl."""
+    process = subprocess.Popen(['journalctl', '-u', unit, '-f', '-n', '0', '--no-pager'],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for line in iter(process.stdout.readline, ''):
+        # Убираем метаданные journalctl
+        clean_line = re.sub(r'^.*?ollama\[\d+\]: ', '', line.strip())
+        yield clean_line
+
+# --- Основная логика ---
 
 def main():
-    parser = argparse.ArgumentParser(description='Ollama Log Exporter for Prometheus')
-    parser.add_argument('--port', type=int, default=9877, help='Port to expose metrics')
-    parser.add_argument('--unit', type=str, default='ollama', help='systemd unit name (default: ollama)')
+    parser = argparse.ArgumentParser(description='Ollama Log Exporter for Prometheus.')
+    parser.add_argument('--port', type=int, default=9877, help='Port to listen on')
+    parser.add_argument('--unit', type=str, default='ollama', help='systemd unit name')
     args = parser.parse_args()
-
-    # Метрики
-    REQ_COUNTER = Counter('ollama_requests_total', 'Total requests to Ollama', ['endpoint', 'method', 'status', 'ip'])
-    ERROR_COUNTER = Counter('ollama_request_errors_total', 'Total error requests to Ollama', ['endpoint', 'method', 'status', 'ip'])
-    DURATION_HIST = Histogram('ollama_request_duration_seconds', 'Request duration to Ollama', ['endpoint', 'method', 'ip'])
 
     start_http_server(args.port)
     print(f"Exporter started on :{args.port}, following journalctl -u {args.unit}")
 
     for line in journalctl_follow(args.unit):
-        parsed = parse_log_line(line)
-        if not parsed:
+        data = parse_log_line(line)
+        if not data:
             continue
-        endpoint = parsed['endpoint']
-        method = parsed['method']
-        status = parsed['status']
-        ip = parsed['ip']
-        duration = duration_to_seconds(parsed['duration'])
-        REQ_COUNTER.labels(endpoint=endpoint, method=method, status=status, ip=ip).inc()
-        if status.startswith('5') or status.startswith('4'):
-            ERROR_COUNTER.labels(endpoint=endpoint, method=method, status=status, ip=ip).inc()
-        DURATION_HIST.labels(endpoint=endpoint, method=method, ip=ip).observe(duration)
+
+        duration_sec = duration_to_seconds(data['duration'])
+        
+        # Обновляем метрики
+        labels = {
+            'ip': data['ip'],
+            'endpoint': data['endpoint'],
+            'method': data['method'],
+            'status': data['status'],
+            'model': data['model']
+        }
+        duration_labels = {
+            'ip': data['ip'],
+            'endpoint': data['endpoint'],
+            'method': data['method'],
+            'model': data['model']
+        }
+
+        REQUESTS_TOTAL.labels(**labels).inc()
+        REQUEST_DURATION.labels(**duration_labels).observe(duration_sec)
+
+        if data['status'].startswith('4') or data['status'].startswith('5'):
+            REQUEST_ERRORS_TOTAL.labels(**labels).inc()
 
 if __name__ == '__main__':
     main()

@@ -4,90 +4,450 @@
     {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "*"},
     {"type": "panel", "id": "graph", "name": "Graph", "version": "*"},
     {"type": "panel", "id": "stat", "name": "Stat", "version": "*"},
-    {"type": "panel", "id": "table", "name": "Table", "version": "*"}
+    {"type": "panel", "id": "table", "name": "Table", "version": "*"},
+    {"type": "panel", "id": "timeseries", "name": "Timeseries", "version": "*"}
   ],
-  "annotations": {"list": []},
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
   "editable": true,
-  "gnetId": null,
+  "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
   "id": null,
-  "iteration": 1620000000000,
   "links": [],
+  "liveNow": false,
   "panels": [
     {
-      "datasource": "Prometheus",
-      "fieldConfig": {"defaults": {}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
-      "id": 1,
-      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"]}},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "P123456789012345"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
       "targets": [
         {
-          "expr": "sum by (endpoint, method, status) (rate(ollama_requests_total[5m]))",
-          "legendFormat": "{{endpoint}} {{method}} {{status}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "P123456789012345"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(ollama_requests_total{status=\"200\"}[5m])) by (endpoint, method, model)",
+          "legendFormat": "{{endpoint}} {{method}} {{model}}",
+          "range": true,
           "refId": "A"
         }
       ],
       "title": "Количество запросов к Ollama",
-      "type": "graph"
+      "type": "timeseries"
     },
     {
-      "datasource": "Prometheus",
-      "fieldConfig": {"defaults": {}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
-      "id": 2,
-      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"]}},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "P123456789012345"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
       "targets": [
         {
-          "expr": "sum by (status) (rate(ollama_request_errors_total[5m]))",
-          "legendFormat": "Ошибка {{status}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "P123456789012345"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(ollama_request_errors_total[5m])) by (status, model)",
+          "legendFormat": "Ошибка {{status}} ({{model}})",
+          "range": true,
           "refId": "A"
         }
       ],
       "title": "Ошибки Ollama (4xx, 5xx)",
-      "type": "graph"
+      "type": "timeseries"
     },
     {
-      "datasource": "Prometheus",
-      "fieldConfig": {"defaults": {}, "overrides": []},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
-      "id": 3,
-      "options": {"reduceOptions": {"values": false, "calcs": ["lastNotNull"]}},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "P123456789012345"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(ollama_request_duration_seconds_bucket[5m])) by (le))",
-          "legendFormat": "95-й перцентиль",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "P123456789012345"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum(rate(ollama_request_duration_seconds_bucket[5m])) by (le, endpoint, model))",
+          "legendFormat": "{{endpoint}} ({{model}})",
+          "range": true,
           "refId": "A"
         }
       ],
       "title": "Время обработки запроса (latency, 95-й перцентиль)",
-      "type": "graph"
+      "type": "timeseries"
     },
     {
-      "datasource": "Prometheus",
-      "fieldConfig": {"defaults": {}, "overrides": []},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
-      "id": 4,
-      "options": {"showHeader": true},
+      "datasource": {
+        "type": "prometheus",
+        "uid": "P123456789012345"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 16
+      },
+      "id": 8,
+      "options": {
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "11.1.0",
       "targets": [
         {
-          "expr": "sum by (ip, endpoint, method) (rate(ollama_requests_total[5m]))",
-          "legendFormat": "{{ip}} {{endpoint}} {{method}}",
-          "refId": "A"
+          "datasource": {
+            "type": "prometheus",
+            "uid": "P123456789012345"
+          },
+          "editorMode": "code",
+          "expr": "sum(increase(ollama_requests_total[5m])) by (ip, endpoint, method, model)",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
         }
       ],
-      "title": "Таблица активности по IP и endpoint",
+      "title": "Активность за последние 5 минут",
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        }
+      ],
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "P123456789012345"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 16
+      },
+      "id": 9,
+      "options": {
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "11.1.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "P123456789012345"
+          },
+          "editorMode": "code",
+          "expr": "ollama_info",
+          "legendFormat": "",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "title": "Конфигурация Ollama",
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        }
+      ],
       "type": "table"
     }
   ],
-  "refresh": "30s",
-  "schemaVersion": 27,
-  "style": "dark",
+  "refresh": "5s",
+  "schemaVersion": 39,
   "tags": ["ollama", "prometheus"],
-  "templating": {"list": []},
-  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "browser",
   "title": "Ollama Log Exporter Dashboard",
   "uid": "ollama-log-exporter",
-  "version": 1
+  "version": 2,
+  "weekStart": ""
 }
