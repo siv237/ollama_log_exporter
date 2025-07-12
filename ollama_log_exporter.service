@@ -1,0 +1,13 @@
+[Unit]
+Description=Ollama Log Exporter for Prometheus
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ollama_log_exporter
+ExecStart=/opt/ollama_log_exporter/venv/bin/python /opt/ollama_log_exporter/exporter.py --port 9877
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
