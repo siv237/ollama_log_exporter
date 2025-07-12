@@ -10,7 +10,9 @@ import argparse
 
 def parse_log_line(line):
     # Пример: [GIN] 2025/07/12 - 09:27:25 | 500 | 59.654288737s | 127.0.0.1 | POST     "/api/generate"
-    pattern = re.compile(r'\[GIN\] (\d{4}/\d{2}/\d{2}) - (\d{2}:\d{2}:\d{2}) \| (\d{3}) \| ([\d\.]+[a-zµ]+) \| ([\d\.]+) \| (\w+)\s+"([^"]+)"')
+    pattern = re.compile(
+        r'^\[GIN\]\s+(\d{4}/\d{2}/\d{2})\s+-\s+(\d{2}:\d{2}:\d{2})\s+\|\s+(\d{3})\s+\|\s+([\d\.smµ]+)\s+\|\s+([\d\.]+)\s+\|\s+(\w+)\s+"([^"\s]+)"'
+    )
     m = pattern.match(line)
     if not m:
         return None
