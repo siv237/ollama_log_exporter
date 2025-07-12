@@ -40,38 +40,15 @@ def parse_log_line(line):
     """Анализирует одну строку лога и возвращает словарь с данными или None."""
     global last_seen_model
 
-    # 1. Парсер для информации о конфигурации
-    # time=... msg="server config" OLLAMA_NUM_PARALLEL=1 ...
-    if 'msg="server config"' in line:
-        # Ищем параметры в строке 'env="map[... OLLAMA_NUM_PARALLEL:0 ...]"'
-        num_parallel_match = re.search(r'OLLAMA_NUM_PARALLEL:(\d+)', line)
-        max_loaded_match = re.search(r'OLLAMA_MAX_LOADED_MODELS:(\d+)', line)
+    # Сначала ищем GIN-логи, т.к. они имеют уникальный формат
+    if '[GIN]' in line:
+        # Извлекаем только саму GIN-строку
+        gin_part_match = re.search(r'(\[GIN\].*)', line)
+        if not gin_part_match:
+            return None
         
-        num_parallel = num_parallel_match.group(1) if num_parallel_match else 'unknown'
-        max_loaded_models = max_loaded_match.group(1) if max_loaded_match else 'unknown'
-        
-        # Версию пока не нашли в логах, оставляем 'unknown'
-        OLLAMA_INFO.labels(
-            version='unknown',
-            num_parallel=num_parallel,
-            max_loaded_models=max_loaded_models
-        ).set(1)
-        return None
-
-    # 2. Парсер для ID модели
-    # time=... msg="starting llama server" path=.../sha256:12345...
-    if 'msg="starting llama server"' in line:
-        # Ищем хэш в строке '...--model /usr/share/ollama/.ollama/models/blobs/sha256-...'
-        match = re.search(r'sha256-([a-f0-9]{64})', line)
-        if match:
-            # Сохраняем только первые 12 символов для читаемости
-            last_seen_model = f"sha256:{match.group(1)[:12]}"
-        return None
-
-    # 3. Парсер для GIN логов (запросы)
-    # [GIN] 2025/07/12 - 09:27:25 | 500 | 59.6s | 127.0.0.1 | POST "/api/generate"
-    if line.startswith('[GIN]'):
-        parts = [p.strip() for p in line.split('|')]
+        gin_part = gin_part_match.group(1)
+        parts = [p.strip() for p in gin_part.split('|')]
         if len(parts) < 5:
             return None
         
@@ -81,7 +58,7 @@ def parse_log_line(line):
         method_endpoint = parts[4].split()
         method = method_endpoint[0]
         endpoint = method_endpoint[1].strip('"')
-
+        
         return {
             'status': status,
             'duration': duration_str,
@@ -91,6 +68,28 @@ def parse_log_line(line):
             'model': last_seen_model
         }
 
+    # Затем парсим логи конфигурации
+    if 'msg="server config"' in line:
+        num_parallel_match = re.search(r'OLLAMA_NUM_PARALLEL:(\d+)', line)
+        max_loaded_match = re.search(r'OLLAMA_MAX_LOADED_MODELS:(\d+)', line)
+        
+        num_parallel = num_parallel_match.group(1) if num_parallel_match else 'unknown'
+        max_loaded_models = max_loaded_match.group(1) if max_loaded_match else 'unknown'
+        
+        OLLAMA_INFO.labels(
+            version='unknown',
+            num_parallel=num_parallel,
+            max_loaded_models=max_loaded_models
+        ).set(1)
+        return None
+
+    # И в конце парсим ID модели
+    if 'msg="starting llama server"' in line:
+        match = re.search(r'sha256-([a-f0-9]{64})', line)
+        if match:
+            last_seen_model = f"sha256:{match.group(1)[:12]}"
+        return None
+        
     return None
 
 def duration_to_seconds(duration):
