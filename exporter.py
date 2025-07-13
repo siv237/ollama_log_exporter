@@ -125,7 +125,7 @@ except locale.Error:
     except locale.Error:
         logging.warning("Could not set Russian locale. Log timestamp parsing might fail.")
 
-BLOB_PATH_RE = re.compile(r'from (/.*/blobs/sha256-[0-9a-f]{64})')
+BLOB_PATH_RE = re.compile(r'(?:from |model=)(/.*/blobs/sha256-[0-9a-f]{64})')
 
 def find_models_path_from_journal():
     """Scans recent journal logs to find the Ollama models path."""
