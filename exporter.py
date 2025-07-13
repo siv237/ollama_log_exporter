@@ -16,6 +16,9 @@ import locale
 import time
 import threading
 import psutil
+import os
+os.environ['LANG'] = 'C'
+os.environ['LC_ALL'] = 'C'
 import xml.etree.ElementTree as ET
 import subprocess
 import shlex
