@@ -127,38 +127,37 @@ except locale.Error:
 
 BLOB_PATH_RE = re.compile(r'from (/.*/blobs/sha256-[0-9a-f]{64})')
 
-def find_latest_blobs_path_from_journal():
-    """Scans the entire ollama journal to find the last used blobs path."""
+def find_models_path_from_journal():
+    """Scans recent journal logs to find the Ollama models path."""
     try:
-        logging.info("Scanning journal for Ollama blobs path...")
+        logging.info("Scanning recent journal logs for Ollama models path...")
+        # Scan the last 1000 lines for efficiency and to get the most recent path
         result = subprocess.run(
-            ['journalctl', '-u', JOURNALCTL_UNIT, '--no-pager', '--output=cat'],
+            ['journalctl', '-u', JOURNALCTL_UNIT, '--no-pager', '--output=cat', '-n', '1000'],
             capture_output=True, text=True, check=True, encoding='utf-8'
         )
         lines = result.stdout.splitlines()
-        last_path = None
         for line in reversed(lines):
             m = BLOB_PATH_RE.search(line)
             if m:
-                path = m.group(1)
-                # Extract the base path, e.g., /root/.ollama/models/blobs
-                base = os.path.dirname(path)
-                last_path = base
-                break # Found the latest one
-        
-        if last_path:
-            logging.info(f"Found latest blobs path from journal: {last_path}")
-        else:
-            logging.warning("Could not find blobs path in Ollama journal.")
-        return last_path
+                # path will be like: /home/user/.ollama/models/blobs/sha256-...
+                blob_file_path = m.group(1)
+                # models_path should be /home/user/.ollama/models
+                models_path = os.path.dirname(os.path.dirname(blob_file_path))
+                logging.info(f"Found Ollama models path from journal: {models_path}")
+                return models_path
+
+        logging.warning("Could not find models path in recent Ollama journal entries.")
+        return None
     except FileNotFoundError:
-        logging.error("journalctl command not found. Please ensure systemd is used.")
+        logging.error("journalctl command not found. Ensure systemd is used and 'journalctl' is in the system's PATH.")
         return None
     except subprocess.CalledProcessError as e:
-        logging.error(f"Error reading Ollama journal: {e.stderr}")
+        # This can happen if the service doesn't exist, which is a valid case
+        logging.warning(f"Could not read journal for '{JOURNALCTL_UNIT}'. Maybe it's not running? Error: {e.stderr}")
         return None
     except Exception as e:
-        logging.error(f"An unexpected error occurred while searching for blobs path: {e}")
+        logging.error(f"An unexpected error occurred while searching for models path: {e}")
         return None
 
 def parse_duration(duration_str):
@@ -562,20 +561,16 @@ def update_resource_metrics():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Ollama Log Exporter for Prometheus.')
     parser.add_argument('--port', type=int, default=9877, help='Port to expose Prometheus metrics on.')
-    parser.add_argument('--models-path', type=str, default='~/.ollama/models', help='Path to the Ollama models directory.')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     # --- Determine Models Path ---
-    # Priority: 1) Journald logs, 2) --models-path argument, 3) Default
-    models_base_path = find_latest_blobs_path_from_journal()
-    if not models_base_path:
-        models_base_path = os.path.expanduser(args.models_path)
-        logging.warning(f"Falling back to path: {models_base_path}")
-    
-    # The path to the 'models' directory, which contains 'manifests' and 'blobs'
-    models_path = os.path.dirname(models_base_path)
+    # The path is determined exclusively by scanning journald logs.
+    models_path = find_models_path_from_journal()
+    if not models_path:
+        logging.critical("Failed to automatically determine Ollama models path from journal. Exporter cannot start.")
+        exit(1)
     logging.info(f"Using models path: {models_path}")
 
     # Initial build of the model map
