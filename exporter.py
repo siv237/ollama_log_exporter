@@ -130,32 +130,35 @@ except locale.Error:
     except locale.Error:
         logging.warning("Could not set Russian locale. Log timestamp parsing might fail.")
 
-BLOB_PATH_RE = re.compile(r'(?:from |model=)(/.*/blobs/sha256-[0-9a-f]{64})')
+MODELS_PATH_RE = re.compile(r'OLLAMA_MODELS:(\S+)')
 
 def find_models_path_from_journal():
-    """Scans recent journal logs to find the Ollama models path."""
+    """Scans journal logs for the OLLAMA_MODELS env var to find the models path."""
     try:
-        logging.info("Scanning recent journal logs for Ollama models path...")
-        # Scan the last 1000 lines for efficiency and to get the most recent path
+        logging.info("Scanning journal logs for OLLAMA_MODELS path (searching from newest to oldest)...")
         env = os.environ.copy()
         env['LANG'] = 'C.UTF-8'
         env['LC_ALL'] = 'C.UTF-8'
-        result = subprocess.run(
-            ['journalctl', '-u', JOURNALCTL_UNIT, '--no-pager', '--output=cat', '-n', '1000'],
-            capture_output=True, text=True, check=True, encoding='utf-8', errors='replace', env=env
-        )
-        lines = result.stdout.splitlines()
-        for line in reversed(lines):
-            m = BLOB_PATH_RE.search(line)
-            if m:
-                # path will be like: /home/user/.ollama/models/blobs/sha256-...
-                blob_file_path = m.group(1)
-                # models_path should be /home/user/.ollama/models
-                models_path = os.path.dirname(os.path.dirname(blob_file_path))
-                logging.info(f"Found Ollama models path from journal: {models_path}")
-                return models_path
 
-        logging.warning("Could not find models path in recent Ollama journal entries.")
+        process = subprocess.Popen(
+            ['journalctl', '-u', JOURNALCTL_UNIT, '--no-pager', '--output=cat', '-r'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', env=env
+        )
+
+        for line in iter(process.stdout.readline, ''):
+            if not line:
+                break
+            # Look for the server config log line
+            if 'OLLAMA_MODELS' in line and 'server config env' in line:
+                m = MODELS_PATH_RE.search(line)
+                if m:
+                    models_path = m.group(1)
+                    logging.info(f"Found Ollama models path from server config log: {models_path}")
+                    process.terminate()
+                    return models_path
+
+        process.wait()
+        logging.warning("Could not find OLLAMA_MODELS path in any Ollama journal entries.")
         return None
     except FileNotFoundError:
         logging.error("journalctl command not found. Ensure systemd is used and 'journalctl' is in the system's PATH.")
