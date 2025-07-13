@@ -3,5 +3,7 @@ __pycache__/
 *.pyo
 .env
 venv/
+state.json
+sdfsdf.txt
 *.log
 .tmp/

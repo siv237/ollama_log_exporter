@@ -33,12 +33,12 @@ LOG_COMMAND = f"journalctl -u {JOURNALCTL_UNIT} -f -n 0"
 OLLAMA_REQUESTS_TOTAL = Counter(
     'ollama_requests_total',
     'Total number of requests to Ollama API',
-    ['model', 'endpoint']
+    ['model', 'endpoint', 'session_id']
 )
 OLLAMA_REQUEST_LATENCY = Histogram(
     'ollama_request_latency_seconds',
     'Request latency for Ollama API',
-    ['model', 'path', 'method']
+    ['model', 'path', 'method', 'session_id']
 )
 OLLAMA_RUNNER_MEMORY_BYTES = Gauge(
     'ollama_runner_memory_bytes',
@@ -399,11 +399,11 @@ def follow_ollama_logs():
                 if model_details:
                     model_name = model_details.get('model_name', 'unknown')
                     # Now, update the request-specific metrics
-                    OLLAMA_REQUESTS_TOTAL.labels(endpoint=endpoint.strip('"'), model=model_name).inc()
+                    OLLAMA_REQUESTS_TOTAL.labels(endpoint=endpoint.strip('"'), model=model_name, session_id=str(pid)).inc()
                     latency_match = re.search(r'\|\s+([\d\.]+\w*s)\s+\|', line)
                     if latency_match:
                         latency_sec = parse_duration(latency_match.group(1))
-                        OLLAMA_REQUEST_LATENCY.labels(method=method, path=endpoint.strip('"'), model=model_name).observe(latency_sec)
+                        OLLAMA_REQUEST_LATENCY.labels(method=method, path=endpoint.strip('"'), model=model_name, session_id=str(pid)).observe(latency_sec)
                 else:
                     # This can happen if the reverse search fails or if the log appears before the start event
                     logging.warning(f"Request for PID {pid} appeared, but could not determine model.")
