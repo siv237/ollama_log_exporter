@@ -40,6 +40,36 @@ def dump_recent_logs_to_file():
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
 
+def dump_startup_log():
+    """Finds the last startup event for Ollama and saves the context to a file."""
+    startup_log_file = "startup_info.txt"
+    logging.info(f"Attempting to find last service start for '{JOURNALCTL_UNIT}'.")
+    try:
+        cmd = f"journalctl -u {JOURNALCTL_UNIT} --no-pager"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
+        log_lines = result.stdout.splitlines()
+
+        last_start_idx = -1
+        for i, line in reversed(list(enumerate(log_lines))):
+            if "Started ollama.service" in line or "Starting Ollama Service" in line:
+                last_start_idx = i
+                break
+
+        if last_start_idx != -1:
+            # Get 10 lines before and 10 lines after the start event
+            start_slice = max(0, last_start_idx - 10)
+            end_slice = last_start_idx + 10
+            context_block = log_lines[start_slice:end_slice]
+            with open(startup_log_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(context_block))
+            logging.info(f"Saved startup context to '{startup_log_file}'.")
+        else:
+            logging.warning("Could not find a startup event in the logs.")
+
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while dumping startup log: {e}")
+
+
 def get_model_sha_map():
     """Fetches Ollama's /api/tags and builds a map: sha256 -> model name."""
     try:
@@ -55,6 +85,51 @@ def get_model_sha_map():
     except Exception as e:
         logging.error(f"Could not fetch model list from Ollama API: {e}")
         return {}
+
+
+def parse_startup_info(startup_log_file="startup_info.txt"):
+    """Parses the startup log file and extracts key events."""
+    events = []
+    try:
+        with open(startup_log_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        for line in lines:
+            # Basic parsing, can be improved with regex for more robustness
+            parts = line.strip().split()
+            if not parts:
+                continue
+            
+            timestamp_str = " ".join(parts[:3])
+            message = " ".join(parts[3:])
+            event = {"timestamp": timestamp_str, "source": "unknown", "type": "info", "message": message}
+
+            if "systemd" in message:
+                event["source"] = "systemd"
+                if "Started ollama.service" in message:
+                    event["type"] = "Service Start"
+                elif "Deactivated successfully" in message:
+                    event["type"] = "Service Stop"
+                elif "Scheduled restart job" in message:
+                    event["type"] = "Restart Scheduled"
+                events.append(event)
+
+            elif "ollama[" in message:
+                event["source"] = "ollama"
+                if "Listening on" in message:
+                    event["type"] = "API Ready"
+                elif 'msg="inference compute"' in message:
+                    event["type"] = "GPU Found"
+                # We only add key ollama events to avoid noise
+                if event["type"] != "info":
+                    events.append(event)
+
+    except FileNotFoundError:
+        logging.warning(f"Startup log file not found: {startup_log_file}")
+    except Exception as e:
+        logging.error(f"Error parsing startup info: {e}")
+    
+    return events
 
 
 def analyze_log_dump():
@@ -75,8 +150,18 @@ def analyze_log_dump():
         with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
             log_lines = f.readlines()
 
-        analysis_content = []
-        analysis_content.append("# Log Analysis\n\n")
+        analysis_content = ["# Log Analysis\n"]
+
+        # Prepend startup info if it exists
+        startup_events = parse_startup_info()
+        if startup_events:
+            analysis_content.append("## Service Startup Events\n")
+            analysis_content.append("| Timestamp | Source | Event Type | Message |\n")
+            analysis_content.append("|---|---|---|---|\n")
+            for event in startup_events:
+                analysis_content.append(f"| {event['timestamp']} | {event['source']} | {event['type']} | `{event['message']}` |\n")
+            analysis_content.append("\n") # It's ok if the file doesn't exist
+
 
         # --- Data Collection Pass ---
         resource_events = []
@@ -249,8 +334,11 @@ def analyze_log_dump():
         logging.error(f"An unexpected error occurred during analysis: {e}")
 
 if __name__ == '__main__':
-    # Step 1: Get the latest logs and save them to a file
+    # Step 1: Find and dump the last startup log
+    dump_startup_log()
+
+    # Step 2: Get the latest logs and save them to a file
     dump_recent_logs_to_file()
     
-    # Step 2: Analyze the created log file
+    # Step 3: Analyze the created log file
     analyze_log_dump()
