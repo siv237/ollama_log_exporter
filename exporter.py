@@ -125,6 +125,42 @@ except locale.Error:
     except locale.Error:
         logging.warning("Could not set Russian locale. Log timestamp parsing might fail.")
 
+BLOB_PATH_RE = re.compile(r'from (/.*/blobs/sha256-[0-9a-f]{64})')
+
+def find_latest_blobs_path_from_journal():
+    """Scans the entire ollama journal to find the last used blobs path."""
+    try:
+        logging.info("Scanning journal for Ollama blobs path...")
+        result = subprocess.run(
+            ['journalctl', '-u', JOURNALCTL_UNIT, '--no-pager', '--output=cat'],
+            capture_output=True, text=True, check=True, encoding='utf-8'
+        )
+        lines = result.stdout.splitlines()
+        last_path = None
+        for line in reversed(lines):
+            m = BLOB_PATH_RE.search(line)
+            if m:
+                path = m.group(1)
+                # Extract the base path, e.g., /root/.ollama/models/blobs
+                base = os.path.dirname(path)
+                last_path = base
+                break # Found the latest one
+        
+        if last_path:
+            logging.info(f"Found latest blobs path from journal: {last_path}")
+        else:
+            logging.warning("Could not find blobs path in Ollama journal.")
+        return last_path
+    except FileNotFoundError:
+        logging.error("journalctl command not found. Please ensure systemd is used.")
+        return None
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error reading Ollama journal: {e.stderr}")
+        return None
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while searching for blobs path: {e}")
+        return None
+
 def parse_duration(duration_str):
     """Converts a duration string (e.g., 5.3s, 10ms) to seconds."""
     val = float(re.findall(r'[\d\.]+', duration_str)[0])
@@ -531,8 +567,19 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+    # --- Determine Models Path ---
+    # Priority: 1) Journald logs, 2) --models-path argument, 3) Default
+    models_base_path = find_latest_blobs_path_from_journal()
+    if not models_base_path:
+        models_base_path = os.path.expanduser(args.models_path)
+        logging.warning(f"Falling back to path: {models_base_path}")
+    
+    # The path to the 'models' directory, which contains 'manifests' and 'blobs'
+    models_path = os.path.dirname(models_base_path)
+    logging.info(f"Using models path: {models_path}")
+
     # Initial build of the model map
-    build_model_map_from_manifests(args.models_path)
+    build_model_map_from_manifests(models_path)
 
     # Start the Prometheus server in a separate thread
     start_http_server(args.port)
@@ -546,7 +593,7 @@ if __name__ == '__main__':
     # Start background task to update the model map
     map_updater = threading.Thread(
         target=background_scheduler, 
-        args=(MODEL_MAP_UPDATE_INTERVAL, build_model_map_from_manifests, args.models_path),
+        args=(MODEL_MAP_UPDATE_INTERVAL, build_model_map_from_manifests, models_path),
         daemon=True
     )
     map_updater.start()
