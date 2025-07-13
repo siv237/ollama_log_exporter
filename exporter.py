@@ -25,6 +25,8 @@ import shlex
 import argparse
 from prometheus_client import start_http_server, Counter, Gauge, Histogram
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 # --- Configuration ---
 JOURNALCTL_UNIT = "ollama.service"
 MODEL_MAP_UPDATE_INTERVAL = 300  # 5 minutes
@@ -569,7 +571,7 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=9877, help='Port to expose Prometheus metrics on.')
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    # logging configured earlier
 
     # --- Determine Models Path ---
     # The path is determined exclusively by scanning journald logs.
