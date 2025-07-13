@@ -132,9 +132,12 @@ def find_models_path_from_journal():
     try:
         logging.info("Scanning recent journal logs for Ollama models path...")
         # Scan the last 1000 lines for efficiency and to get the most recent path
+        env = os.environ.copy()
+        env['LANG'] = 'C.UTF-8'
+        env['LC_ALL'] = 'C.UTF-8'
         result = subprocess.run(
             ['journalctl', '-u', JOURNALCTL_UNIT, '--no-pager', '--output=cat', '-n', '1000'],
-            capture_output=True, text=True, check=True, encoding='utf-8'
+            capture_output=True, text=True, check=True, encoding='utf-8', errors='replace', env=env
         )
         lines = result.stdout.splitlines()
         for line in reversed(lines):
