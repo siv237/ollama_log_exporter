@@ -19,14 +19,13 @@ import psutil
 import xml.etree.ElementTree as ET
 import subprocess
 import shlex
+import argparse
 from prometheus_client import start_http_server, Counter, Gauge, Histogram
 
 # --- Configuration ---
-PROMETHEUS_PORT = 9877
 JOURNALCTL_UNIT = "ollama.service"
 MODEL_MAP_UPDATE_INTERVAL = 300  # 5 minutes
 PROCESS_METRICS_UPDATE_INTERVAL = 5 # 5 seconds
-OLLAMA_MANIFESTS_PATH = "/root/.ollama/models/manifests/registry.ollama.ai/library/"
 LOG_COMMAND = f"journalctl -u {JOURNALCTL_UNIT} -f -n 0"
 
 # --- Metrics ---
@@ -139,18 +138,21 @@ def parse_duration(duration_str):
         return val * 3600
     return val # Assumes seconds if no unit
 
-def build_model_map_from_manifests():
+def build_model_map_from_manifests(models_base_path):
     """Builds a map from blob digest to model name by scanning manifest files."""
     global model_map
-    logging.info(f"Building model map from manifests in {OLLAMA_MANIFESTS_PATH}...")
-    new_map = {}
+    temp_model_map = {}
+
+    # Construct the full path to the manifests directory
+    manifests_path = os.path.join(os.path.expanduser(models_base_path), "manifests", "registry.ollama.ai", "library")
+    logging.info(f"Building model map from manifests in {manifests_path}...")
     try:
-        if not os.path.isdir(OLLAMA_MANIFESTS_PATH):
-            logging.warning(f"Manifests directory not found: {OLLAMA_MANIFESTS_PATH}. Skipping map build.")
+        if not os.path.isdir(manifests_path):
+            logging.warning(f"Manifests directory not found: {manifests_path}. Skipping map build.")
             return
 
-        for model_name in os.listdir(OLLAMA_MANIFESTS_PATH):
-            model_dir = os.path.join(OLLAMA_MANIFESTS_PATH, model_name)
+        for model_name in os.listdir(manifests_path):
+            model_dir = os.path.join(manifests_path, model_name)
             if os.path.isdir(model_dir):
                 for tag in os.listdir(model_dir):
                     manifest_file = os.path.join(model_dir, tag)
@@ -164,7 +166,7 @@ def build_model_map_from_manifests():
                                 blob_digest = layer.get('digest', '').replace('sha256:', '')
                                 if blob_digest:
                                     full_model_name = f"{model_name}:{tag}"
-                                    new_map[blob_digest] = full_model_name
+                                    temp_model_map[blob_digest] = full_model_name
                                     logging.info(f"  Mapped blob {blob_digest[:12]}... to {full_model_name}")
                                 break # Assume one model layer per manifest
                     except json.JSONDecodeError:
@@ -174,10 +176,10 @@ def build_model_map_from_manifests():
     except Exception as e:
         logging.error(f"An unexpected error occurred while scanning manifests: {e}")
 
-    if not new_map:
-        logging.warning("Model map is empty. No models found in manifests directory.")
-
-    model_map = new_map
+    if not temp_model_map:
+        logging.warning("No models found in manifests. The map is empty.")
+    
+    model_map = temp_model_map
 
 def parse_llama_server_line(line):
     """Extracts model details from a 'starting llama server' or related log line."""
@@ -424,11 +426,11 @@ def follow_ollama_logs():
         logging.error(f"An error occurred while following logs: {e}")
 
 
-def background_scheduler(interval, task_func):
+def background_scheduler(interval, task_func, *args, **kwargs):
     """Runs a task function periodically in a loop."""
     while True:
         try:
-            task_func()
+            task_func(*args, **kwargs)
         except Exception as e:
             logging.error(f"Error in background task {task_func.__name__}: {e}")
         time.sleep(interval)
@@ -522,24 +524,32 @@ def update_resource_metrics():
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Ollama Log Exporter for Prometheus.')
+    parser.add_argument('--port', type=int, default=9877, help='Port to expose Prometheus metrics on.')
+    parser.add_argument('--models-path', type=str, default='~/.ollama/models', help='Path to the Ollama models directory.')
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     # Initial build of the model map
-    build_model_map_from_manifests()
+    build_model_map_from_manifests(args.models_path)
 
     # Start the Prometheus server in a separate thread
-    start_http_server(PROMETHEUS_PORT)
-    logging.info(f"Prometheus exporter server started on port {PROMETHEUS_PORT}")
+    start_http_server(args.port)
+    logging.info(f"Prometheus exporter server started on port {args.port}")
 
     # Start the background thread for updating resource metrics
     resource_thread = threading.Thread(target=update_resource_metrics, daemon=True)
     resource_thread.start()
     logging.info("Started background thread for resource monitoring.")
 
-    # Start background tasks in separate threads
-    map_updater = threading.Thread(target=background_scheduler, args=(MODEL_MAP_UPDATE_INTERVAL, build_model_map_from_manifests), daemon=True)
+    # Start background task to update the model map
+    map_updater = threading.Thread(
+        target=background_scheduler, 
+        args=(MODEL_MAP_UPDATE_INTERVAL, build_model_map_from_manifests, args.models_path),
+        daemon=True
+    )
     map_updater.start()
-
 
     # The main thread will follow logs
     try:
