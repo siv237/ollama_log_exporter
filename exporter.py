@@ -148,11 +148,13 @@ def find_models_path_from_journal():
         for line in iter(process.stdout.readline, ''):
             if not line:
                 break
-            # Look for the server config log line
-            if 'OLLAMA_MODELS' in line and 'server config env' in line:
+            # Look for the server config log line containing the models path definition
+            if 'OLLAMA_MODELS:' in line:
                 m = MODELS_PATH_RE.search(line)
                 if m:
                     models_path = m.group(1)
+                    # The path might have trailing characters like ']' or '"', clean it up.
+                    models_path = models_path.strip(']"')
                     logging.info(f"Found Ollama models path from server config log: {models_path}")
                     process.terminate()
                     return models_path
