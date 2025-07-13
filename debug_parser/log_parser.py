@@ -1,6 +1,8 @@
 import subprocess
 import logging
 import re
+import requests
+import json
 
 # --- Configuration ---
 # The systemd service unit for Ollama
@@ -38,102 +40,203 @@ def dump_recent_logs_to_file():
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
 
+def get_model_sha_map():
+    """Fetches Ollama's /api/tags and builds a map: sha256 -> model name."""
+    try:
+        resp = requests.get("http://localhost:11434/api/tags", timeout=3)
+        data = resp.json()
+        sha_map = {}
+        for m in data.get("models", []):
+            digest = m.get("digest", "")
+            name = m.get("name", m.get("model", ""))
+            if digest and name:
+                sha_map[digest] = name
+        return sha_map
+    except Exception as e:
+        logging.error(f"Could not fetch model list from Ollama API: {e}")
+        return {}
+
+
 def analyze_log_dump():
     """Reads the log dump file and creates a structured analysis file."""
     logging.info(f"Analyzing log file '{OUTPUT_FILE}'...")
-    analysis_output_file = "log_analysis.txt"
-    
+    analysis_output_file = "log_analysis.md"
+
+    model_sha_map = get_model_sha_map()
+
+    # --- Модельные подробности ---
+    model_events = []
+    current_model_info = None
+    loading_pattern = re.compile(r'loading" model=(\S*sha256-([a-f0-9]{64}))')
+    arch_pattern = re.compile(r'architecture=([\w\d\-_.]+)')
+    name_pattern = re.compile(r'general\.name\s*(?:str)?\s*=\s*([\w\d\-_.: ]+)')
+
     try:
         with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
             log_lines = f.readlines()
-        
-        analysis_content = []
-        analysis_content.append("--- Log Analysis ---\n\n")
 
-        # --- 1. Hardware and Resource Analysis ---
-        analysis_content.append("## 1. Hardware and Resource Information\n")
-        found_resources = False
-        for line in log_lines:
+        analysis_content = []
+        analysis_content.append("# Log Analysis\n\n")
+
+        # --- Data Collection Pass ---
+        resource_events = []
+        gpu_layers_pattern = re.compile(r'layers\.gpu=(\d+/\d+)')
+
+        for idx, line in enumerate(log_lines):
             if 'msg="system memory"' in line:
                 total_mem = re.search(r'total="([^"]+)"', line)
                 free_mem = re.search(r'free="([^"]+)"', line)
                 if total_mem and free_mem:
-                    analysis_content.append(f"- System Memory: Total = {total_mem.group(1)}, Free = {free_mem.group(1)}\n")
-                    found_resources = True
+                    info_str = f"- System Memory: Total = {total_mem.group(1)}, Free = {free_mem.group(1)}"
+                    resource_events.append({'line_num': idx, 'type': 'system', 'content': info_str})
 
             if 'msg=offload' in line:
-                library = re.search(r'library=(\w+)', line)
-                available_mem = re.search(r'memory\.available="([^"]+)"', line)
-                if library and available_mem:
-                    analysis_content.append(f"- GPU Detected: Library = {library.group(1)}, Available VRAM = {available_mem.group(1)}\n")
-                    found_resources = True
-        
-        if not found_resources:
-            analysis_content.append("- No hardware and resource information found in this log slice.\n")
-        
-        analysis_content.append("\n")
+                library_match = re.search(r'library=(\w+)', line)
+                available_mem_match = re.search(r'memory\.available="([^"]+)"', line)
+                if library_match and available_mem_match:
+                    gpu_id_match = re.search(r'gpu=(\d+)', line)
+                    gpu_id = gpu_id_match.group(1) if gpu_id_match else '0'
+                    library = library_match.group(1)
+                    vram = available_mem_match.group(1).strip('[]')
+                    info_str = f"- GPU {gpu_id} ({library}): Available VRAM = {vram}"
+                    resource_events.append({'line_num': idx, 'type': 'gpu', 'content': info_str})
 
-        # --- 2. Model Lifecycle Analysis ---
-        analysis_content.append("## 2. Model Lifecycle Analysis\n")
-        models_by_pid = {}
-        log_pattern = re.compile(r'^(\S+Z?)\s+.*?ollama\[(\d+)\]:\s+(.*)')
+            layers_match = gpu_layers_pattern.search(line)
+            if layers_match:
+                layers_info = layers_match.group(1)
+                info_str = f"- Layer Distribution: {layers_info} on GPU"
+                resource_events.append({'line_num': idx, 'type': 'layers', 'content': info_str})
 
-        for line in log_lines:
-            match = log_pattern.match(line)
-            if not match:
-                continue
-            
-            timestamp, pid, message = match.groups()
-
-            # A. Model Load Events
-            if 'llama_model_loader: - kv' in message:
-                if pid not in models_by_pid:
-                    models_by_pid[pid] = {'start_time': timestamp, 'params': {}}
+        analysis_content.append("## Model Sessions Analysis\n")
+        # Собираем подробности по каждому переключению модели (loading)
+        for idx, line in enumerate(log_lines):
+            loading_match = loading_pattern.search(line)
+            if loading_match:
+                if current_model_info:
+                    current_model_info['end_line'] = idx
+                    model_events.append(current_model_info)
                 
-                kv_match = re.search(r'kv\s+\d+:\s+([^=]+?)\s+(?:str|u32|f32|arr\[str,\d+\])\s+=\s+(.*)', message)
-                if kv_match:
-                    key, value = kv_match.groups()
-                    key = key.strip()
-                    # We only care about a few key parameters for this analysis
-                    if key in ['general.name', 'general.size_label', 'phi3.block_count', 'phi3.context_length']:
-                         models_by_pid[pid]['params'][key] = value.strip()
+                blob_path = loading_match.group(1)
+                digest = loading_match.group(2)
+                name = model_sha_map.get(digest, None)
+                current_model_info = {
+                    'digest': digest,
+                    'blob_path': blob_path,
+                    'name': name,
+                    'arch': None,
+                    'lines': [line],
+                    'start_line': idx,
+                    'end_line': None,
+                    'load_duration': None,
+                    'required_vram': None
+                }
+            elif current_model_info:
+                current_model_info['lines'].append(line)
+                if not current_model_info['arch']:
+                    arch_match = arch_pattern.search(line)
+                    if arch_match:
+                        current_model_info['arch'] = arch_match.group(1)
+                if not current_model_info['name']:
+                    name_match = name_pattern.search(line)
+                    if name_match:
+                        current_model_info['name'] = name_match.group(1).strip()
         
-        if models_by_pid:
-            for pid, data in models_by_pid.items():
-                analysis_content.append(f"- Model Load detected for PID: {pid} at {data['start_time']}\n")
-                for key, value in data['params'].items():
-                    analysis_content.append(f"    - {key}: {value}\n")
-                analysis_content.append("\n")
-        else:
-            analysis_content.append("- No model load events found in this log slice.\n")
+        if current_model_info:
+            current_model_info['end_line'] = len(log_lines)
+            model_events.append(current_model_info)
 
-        analysis_content.append("\n")
-
-        # --- 3. API Request Analysis ---
-        analysis_content.append("## 3. API Request Analysis\n")
         api_requests = []
         gin_pattern = re.compile(r'\[GIN\] (\S+ - \S+) \| (\d+) \|\s+([^|]+) \|\s+([^|]+) \|\s+(\w+)\s+(\S+)')
+        gin_lines = [(idx, line) for idx, line in enumerate(log_lines) if gin_pattern.search(line)]
 
-        for line in log_lines:
+        model_ranges = [(m['start_line'], m['end_line'], m) for m in model_events]
+
+        for idx, line in gin_lines:
             match = gin_pattern.search(line)
-            if match:
-                timestamp, status, latency, ip, method, path = match.groups()
-                api_requests.append({
-                    'time': timestamp.strip(),
-                    'status': status.strip(),
-                    'latency': latency.strip(),
-                    'ip': ip.strip(),
-                    'method': method.strip(),
-                    'path': path.strip()
-                })
-        
-        if api_requests:
-            for req in api_requests:
-                analysis_content.append(f"- {req['time']}: {req['method']} {req['path']} from {req['ip']} -> {req['status']} ({req['latency']})\n")
+            if not match:
+                continue
+            timestamp, status, latency, ip, method, path = match.groups()
+            # Find which model session this request belongs to
+            active_event = None
+            clean_path = path.strip().strip('"')
+
+            # Requests for /api/tags are global and not tied to a model session
+            if clean_path != '/api/tags':
+                for me in model_events:
+                    if me['start_line'] <= idx < me['end_line']:
+                        active_event = me
+                        break
+            
+            api_requests.append({
+                'time': timestamp.strip(), 'status': status.strip(), 'latency': latency.strip(),
+                'ip': ip.strip(), 'method': method.strip(), 'path': path.strip(),
+                'model_event': active_event
+            })
+
+        if not model_events:
+            analysis_content.append("No model load events found.\n")
         else:
-            analysis_content.append("- No API requests found in this log slice.\n")
-        
-        analysis_content.append("\n")
+            for m_event in model_events:
+                for line in m_event['lines']:
+                    if not m_event.get('load_duration'):
+                        llm_load_match = re.search(r'llm_load.duration=(\S+)', line)
+                        if llm_load_match:
+                            m_event['load_duration'] = llm_load_match.group(1)
+                    
+                    if not m_event.get('required_vram'):
+                        offload_match = re.search(r'msg=offload.*?memory\.required\.full="([^"]+)"', line)
+                        if offload_match:
+                            m_event['required_vram'] = offload_match.group(1)
+            
+            for i, m_event in enumerate(model_events):
+                model_name = m_event.get('name') or m_event.get('digest', 'Unknown')[:12]
+                analysis_content.append(f"\n### Сессия {i+1}: {model_name}\n")
+                analysis_content.append(f"- **Модель**: {m_event.get('name', '(не найдено)')}\n")
+                analysis_content.append(f"- **SHA256**: {m_event.get('digest', 'N/A')}\n")
+                analysis_content.append(f"- **Архитектура**: {m_event.get('arch', '(не найдено)')}\n")
+                if m_event.get('load_duration'):
+                    analysis_content.append(f"- **Время загрузки**: {m_event['load_duration']}\n")
+                if m_event.get('required_vram'):
+                    analysis_content.append(f"- **Требуемая VRAM**: {m_event['required_vram']}\n")
+                analysis_content.append(f"- **Эпоха обслуживания**: строки {m_event['start_line']+1}..{m_event['end_line']} лога\n")
+
+                # --- Расширенный анализ ресурсов ---
+                session_resources = [res for res in resource_events if m_event['start_line'] <= res['line_num'] < m_event['end_line']]
+                
+                system_mems = [res['content'] for res in session_resources if res['type'] == 'system']
+                gpus = [res['content'] for res in session_resources if res['type'] == 'gpu']
+                layers = [res['content'] for res in session_resources if res['type'] == 'layers']
+
+                if not gpus and not layers:
+                    analysis_content.append("- **Используемое устройство**: CPU\n")
+                
+                if system_mems or gpus or layers:
+                    analysis_content.append("\n  **Состояние ресурсов в сессии:**\n")
+                    if system_mems:
+                        analysis_content.extend([f"    {mem}\n" for mem in set(system_mems)])
+                    if gpus:
+                        analysis_content.extend([f"    {gpu}\n" for gpu in set(gpus)])
+                    if layers:
+                        analysis_content.extend([f"    {layer}\n" for layer in set(layers)])
+                
+                analysis_content.append("\n  **Обслуженные API запросы:**\n\n")
+                session_requests = [req for req in api_requests if req['model_event'] and req['model_event']['digest'] == m_event['digest'] and req['model_event']['start_line'] == m_event['start_line']]
+
+                if session_requests:
+                    analysis_content.append("| time | ip | method | path |\n")
+                    analysis_content.append("|---|---|---|---|\n")
+                    for req in session_requests:
+                        analysis_content.append(f"| {req['time']} | {req['ip']} | {req['method']} | {req['path']} |\n")
+                else:
+                    analysis_content.append("    (нет запросов в этой сессии)\n")
+
+        unbound_requests = [req for req in api_requests if not req['model_event']]
+        if unbound_requests:
+            analysis_content.append("\n### Непривязанные запросы\n\n")
+            analysis_content.append("| time | ip | method | path |\n")
+            analysis_content.append("|---|---|---|---|\n")
+            for req in unbound_requests:
+                analysis_content.append(f"| {req['time']} | {req['ip']} | {req['method']} | {req['path']} |\n")
 
         with open(analysis_output_file, 'w', encoding='utf-8') as f:
             f.writelines(analysis_content)
