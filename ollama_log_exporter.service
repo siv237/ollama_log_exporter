@@ -8,6 +8,8 @@ WorkingDirectory=/opt/ollama_log_exporter
 ExecStart=/opt/ollama_log_exporter/venv/bin/python /opt/ollama_log_exporter/exporter.py --port 9877
 Restart=always
 User=root
+KillMode=process
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
