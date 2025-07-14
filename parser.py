@@ -99,25 +99,39 @@ def build_sha_to_name_map_from_manifests(manifests_root):
     return sha_to_name
 
 def parse_log(log_file, sha_to_name=None):
-    """Парсит лог-файл и возвращает список сессий (stateful: сессия начинается только по runner или VRAM loading)."""
+    """Парсит лог-файл и возвращает список сессий (stateful: сессия начинается только по runner, VRAM loading или смене PID)."""
+    import re
     sessions = []
     current_session = None
+    current_pid = None
     with open(log_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     for i, line in enumerate(lines):
+        # --- Извлекаем PID из строки ollama[PID] ---
+        m_pid = re.search(r'ollama\[(\d+)\]', line)
+        pid = m_pid.group(1) if m_pid else None
         is_new_session = False
-        # Новая сессия только по runner или VRAM loading
-        if 'msg="starting llama server"' in line or 'msg="new model will fit in available VRAM in single GPU, loading"' in line:
+        # Новая сессия по runner, VRAM loading или смене PID
+        if (
+            'msg="starting llama server"' in line or
+            'msg="new model will fit in available VRAM in single GPU, loading"' in line or
+            (pid and pid != current_pid)
+        ):
             is_new_session = True
         if is_new_session:
             if current_session and (
                 current_session.get('sha256') or current_session.get('offload_info') or current_session.get('model_name') or current_session.get('model_sha256')
             ):
-                    sessions.append(current_session)
+                sessions.append(current_session)
             current_session = {'raw_lines': [], 'start_time': line.split()[0]}
+            current_pid = pid
+            if pid:
+                current_session['pid'] = pid
         if not current_session:
             continue  # Игнорируем строки до первой сессии
         current_session['raw_lines'].append(line)
+        if pid and 'pid' not in current_session:
+            current_session['pid'] = pid
         # --- Извлекаем параметры из строки загрузки модели ---
         if 'msg="new model will fit in available VRAM in single GPU, loading"' in line:
             m_sha = re.search(r'sha256-([a-f0-9]{64})', line)
@@ -201,6 +215,7 @@ def generate_md_report(sessions, output_file):
             model_name = get_model_name(sha, session)
             f.write(f"## Сессия {i+1}: {model_name}\n\n")
             f.write(f"*   **Время старта сессии:** {session.get('start_time', 'N/A')}\n")
+            f.write(f"*   **PID процесса Ollama:** {session.get('pid', 'N/A')}\n")
             f.write(f"*   **Модель:** {model_name}\n")
             f.write(f"*   **SHA256:** {sha}\n")
             if session.get('sha256_extracted_from_vram_loading'):
@@ -543,13 +558,38 @@ if __name__ == "__main__":
             model_name = get_model_name(session.get('sha256'), session)
             f.write(f"## Сессия {i+1}: {model_name}\n\n")
             f.write(f"*   **Время старта сессии:** {session.get('start_time', 'N/A')}\n")
+            f.write(f"*   **PID процесса Ollama:** {session.get('pid', 'N/A')}\n")
             f.write(f"*   **Модель:** {model_name}\n")
             f.write(f"*   **SHA256:** {session.get('sha256', 'N/A')}\n")
             if session.get('sha256_extracted_from_vram_loading'):
                 f.write(f"*   _SHA256 извлечён из строки VRAM loading, runner не запускался_\n")
             f.write(f"*   **Архитектура:** {session.get('architecture', 'N/A')}\n")
-            f.write(f"*   **Путь к модели:** {session.get('model_path', 'N/A')}\n")
-            f.write(f"*   **GPU:** {session.get('gpu', 'N/A')}\n")
+            # GPU: собираем все параметры из offload_info
+            gpu_info = []
+            offload = session.get('offload_info', {})
+            if offload:
+                gpu_part = f"GPU{offload['gpu']}" if 'gpu' in offload else None
+                lib_part = offload.get('library')
+                name_part = offload.get('name')
+                gpu_str = ''
+                if gpu_part:
+                    gpu_str += gpu_part
+                if lib_part:
+                    gpu_str += f" ({lib_part}"
+                    if name_part:
+                        gpu_str += f", {name_part}"
+                    gpu_str += ")"
+                elif name_part:
+                    if gpu_str:
+                        gpu_str += f" ({name_part})"
+                    else:
+                        gpu_str = name_part
+                if gpu_str:
+                    f.write(f"*   **GPU:** {gpu_str}\n")
+            # Путь к модели
+            model_path = session.get('model_path')
+            if model_path and model_path != 'N/A':
+                f.write(f"*   **Путь к модели:** {model_path}\n")
             f.write(f"*   **CTX size:** {session.get('ctx_size', 'N/A')}\n")
             f.write(f"*   **Batch size:** {session.get('batch_size', 'N/A')}\n")
             f.write(f"*   **GPU layers:** {session.get('gpu_layers', 'N/A')}\n")
