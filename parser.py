@@ -131,9 +131,13 @@ def parse_log(log_file, sha_to_name=None):
     current_pid = None
     runner_block_lines = 0
     metadata_block_active = False
+    param_buffer = []
     with open(log_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     for i, line in enumerate(lines):
+        # --- Буферизация параметров print_info: model params ---
+        if 'print_info: model params' in line:
+            param_buffer.append(line)
         # --- Извлекаем PID из строки ollama[PID] ---
         m_pid = re.search(r'ollama\[(\d+)\]', line)
         pid = m_pid.group(1) if m_pid else None
@@ -149,7 +153,13 @@ def parse_log(log_file, sha_to_name=None):
                 current_session.get('sha256') or current_session.get('offload_info') or current_session.get('model_name') or current_session.get('model_sha256')
             ):
                     sessions.append(current_session)
-            current_session = {'raw_lines': [], 'start_time': line.split()[0]}
+            # --- ДОБАВЛЕНО: расширяем начало сессии назад на 30 строк ---
+            start_idx = max(0, i-30)
+            current_session = {'raw_lines': lines[start_idx:i+1], 'start_time': line.split()[0]}
+            # --- ДОБАВЛЕНО: если в буфере есть параметры, добавляем их в начало raw_lines новой сессии ---
+            if param_buffer:
+                current_session['raw_lines'] = param_buffer + current_session['raw_lines']
+                param_buffer = []
             current_pid = pid
             if pid:
                 current_session['pid'] = pid
@@ -183,9 +193,18 @@ def parse_log(log_file, sha_to_name=None):
                         current_session['architecture'] = m.group(1).strip()
                 # Новый: парсим print_info: model params = ...
                 if 'print_info: model params' in line:
-                    m = re.search(r'print_info: model params\s*=\s*([\d\.]+\s*[BMK]?)', line)
+                    m = re.search(r'print_info: model params\s*=\s*([\d\.]+\s*[ ]*[BMKbmkg])', line)
                     if m and 'params_label' not in current_session:
                         current_session['params_label'] = m.group(1).strip()
+                # Новый: парсим print_info: file size = ...
+                if 'print_info: file size' in line:
+                    m = re.search(r'print_info: file size\s*=\s*([\d\.]+\s*[GMK]i?B)', line)
+                    if not m:
+                        m = re.search(r'print_info: file size\s*=\s*([\d\.]+\s*[GMK]i?B)', line.replace('   ', ' '))
+                    if not m:
+                        m = re.search(r'print_info: file size\s*=\s*([^\(]+)', line)
+                    if m and 'file_size_label' not in current_session:
+                        current_session['file_size_label'] = m.group(1).strip().split('(')[0].strip()
                 # Если строка не содержит general.*, завершаем блок сбора метаданных
                 if not any(x in line for x in ['general.name', 'general.size_label', 'general.architecture', 'print_info: model params']):
                     metadata_block_active = False
@@ -239,11 +258,11 @@ def parse_log(log_file, sha_to_name=None):
     if current_session and (
         current_session.get('sha256') or current_session.get('offload_info') or current_session.get('model_name') or current_session.get('model_sha256')
     ):
-        # --- ДОБАВЛЕНО: ищем model params по всей сессии, если не найдено в блоке runner'а ---
+        # --- ДОБАВЛЕНО: ищем print_info: model params по всей сессии, если не найдено в блоке runner'а ---
         if 'params_label' not in current_session:
             import re
             for l in current_session.get('raw_lines', []):
-                m = re.search(r'model params\s*=\s*([\d\.]+\s*[ ]*[BMKbmkg])', l, re.IGNORECASE)
+                m = re.search(r'print_info: model params.*=\s*([\d\.]+\s*[BMK]?)', l)
                 if m:
                     current_session['params_label'] = m.group(1).strip()
                     break
@@ -359,7 +378,8 @@ def filter_log(input_file, output_file):
                 "general.name",
                 "general.size_label",
                 "architecture=",
-                "general.architecture"
+                "general.architecture",
+                "print_info: model params"  # <--- ДОБАВЛЕНО!
             ]):
                 fout.write(line)
             elif "[GIN]" in line:
@@ -618,6 +638,76 @@ if __name__ == "__main__":
     # 5. Анализируем очищенный лог и генерируем отчёт
     parsed_sessions = parse_log(filtered_log, sha_to_name)
 
+    # --- УБРАНА ТЕСТОВАЯ ЗАГЛУШКА params_label ---
+    # (оставлен только реальный механизм поиска params_label)
+
+    # --- ДОПОЛНИТЕЛЬНЫЙ ПРОХОД: сопоставление params_label по SHA256 в окне ±100 строк ---
+    with open(filtered_log, 'r', encoding='utf-8') as f:
+        all_log_lines = f.readlines()
+    params_pairs = []  # список словарей: {'sha256': ..., 'params_label': ...}
+    import re
+    for idx, line in enumerate(all_log_lines):
+        m = re.search(r'print_info: model params\s*=\s*([\d\.]+\s*[BMKbmkg])', line)
+        if m:
+            params_label = m.group(1).strip()
+            sha = None
+            # Сначала ищем sha256 в 100 строках вниз
+            for j in range(idx+1, min(idx+101, len(all_log_lines))):
+                msha = re.search(r'sha256-([a-f0-9]{64})', all_log_lines[j])
+                if msha:
+                    sha = msha.group(1)
+                    break
+            # Если не нашли — ищем вверх
+            if not sha:
+                for j in range(max(0, idx-100), idx):
+                    msha = re.search(r'sha256-([a-f0-9]{64})', all_log_lines[j])
+                    if msha:
+                        sha = msha.group(1)
+                        break
+            if sha:
+                params_pairs.append({'sha256': sha, 'params_label': params_label})
+    # Для каждой сессии, если sha256 совпадает и params_label ещё не установлен — добавить
+    for session in parsed_sessions:
+        sess_sha = session.get('sha256') or session.get('model_sha256')
+        if not sess_sha or 'params_label' in session:
+            continue
+        for pair in params_pairs:
+            if pair['sha256'] == sess_sha:
+                session['params_label'] = pair['params_label']
+                break
+    # --- КОНЕЦ ДОПОЛНИТЕЛЬНОГО ПРОХОДА ---
+
+    # --- ДОПОЛНИТЕЛЬНЫЙ ПРОХОД: сопоставление offload_info по PID и времени ---
+    # Собираем все offload-блоки с PID и индексом
+    offload_blocks = []
+    for idx, line in enumerate(all_log_lines):
+        if 'msg=offload' in line:
+            m_pid = re.search(r'ollama\[(\d+)\]', line)
+            pid = m_pid.group(1) if m_pid else None
+            offload_blocks.append({'idx': idx, 'pid': pid, 'line': line})
+    # Для каждой сессии, если offload_info отсутствует, ищем ближайший offload-блок ниже по индексу с тем же PID
+    for session in parsed_sessions:
+        if session.get('offload_info'):
+            continue
+        sess_pid = session.get('pid')
+        # Находим индекс первой строки raw_lines в all_log_lines
+        raw_lines = session.get('raw_lines', [])
+        if not raw_lines:
+            continue
+        try:
+            first_line = raw_lines[0]
+            sess_start_idx = next(i for i, l in enumerate(all_log_lines) if l == first_line)
+        except Exception:
+            continue
+        # Ищем offload-блок с тем же PID, ближайший после старта сессии
+        for ob in offload_blocks:
+            if ob['pid'] == sess_pid and ob['idx'] >= sess_start_idx:
+                # Парсим offload_info
+                offload_str = ob['line'].split('msg=offload ')[1]
+                session['offload_info'] = parse_key_value_string(offload_str)
+                break
+    # --- КОНЕЦ ДОПОЛНИТЕЛЬНОГО ПРОХОДА ---
+
     # Новый шаг: парсим GIN-запросы и привязываем к сессиям
     gin_requests = parse_gin_requests(dump_file)
     parsed_sessions = assign_requests_to_sessions(parsed_sessions, gin_requests)
@@ -740,9 +830,7 @@ if __name__ == "__main__":
                 f.write(f"*   **VRAM требуется:** {session.get('vram_required')}\n")
             # Вместо строки с size_label/size_str
             params_label = session.get('params_label')
-            if params_label and size_str:
-                f.write(f"*   **Размер модели:** {params_label} ({size_str})\n")
-            elif params_label:
+            if params_label:
                 f.write(f"*   **Размер модели:** {params_label}\n")
             elif size_label != 'N/A' and size_str:
                 f.write(f"*   **Размер модели:** {size_label} ({size_str})\n")
