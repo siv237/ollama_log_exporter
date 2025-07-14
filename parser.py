@@ -723,39 +723,31 @@ if __name__ == "__main__":
         raw_lines = session.get('raw_lines', [])
         llama_init_info = [l.strip() for l in raw_lines if 'llama_init_from_model' in l]
         if llama_init_info:
-            params = {}
+            params_rows = []
             notifications = []
             for l in llama_init_info:
-                found_param = False
-                # Ищем все пары ключ=значение или ключ:значение (в строке может быть несколько пар через запятую)
-                for part in re.split(r',\s*', l):
-                    # Ключ — только буквы/цифры/скобки/подчёркивания, без пробелов и без даты
-                    m = re.search(r'llama_init_from_model:\s*([\w\(\)_]+)\s*[=:]\s*(.+)', part)
-                    if m:
-                        key = m.group(1).strip()
-                        val = m.group(2).strip()
-                        params[key] = val
-                        found_param = True
-                    else:
-                        # Для остальных пар внутри строки (без префикса llama_init_from_model:)
-                        m2 = re.search(r'^([\w\(\)_]+)\s*[=:]\s*(.+)', part)
-                        if m2:
-                            key = m2.group(1).strip()
-                            val = m2.group(2).strip()
-                            params[key] = val
-                            found_param = True
-                # Если не найдено ни одной пары — это уведомление
-                if not found_param:
-                    notif = l.split('llama_init_from_model:')[-1].strip()
-                    if notif:
-                        notifications.append(notif)
-                # Спец. случай: n_ctx_per_seq (2048) < n_ctx_train (8192)
-                m3 = re.search(r'n_ctx_per_seq \((\d+)\) < n_ctx_train \((\d+)\)', l)
-                if m3:
-                    params['n_ctx_per_seq'] = m3.group(1)
-                    params['n_ctx_train'] = m3.group(2)
-            if params:
-                session['llama_init_params'] = params
+                if 'llama_init_from_model:' in l:
+                    parts = l.split('llama_init_from_model:', 1)
+                    # timestamp — только дата/время (до первого пробела)
+                    full_prefix = parts[0].strip()
+                    timestamp = full_prefix.split(' ')[0] if full_prefix else ''
+                    after_colon = parts[1].strip()
+                else:
+                    timestamp = ''
+                    after_colon = l.strip()
+                param_match = re.search(r'(.+?)\s*=\s*([^,]+)', after_colon)
+                if param_match:
+                    for part in re.split(r',\s*', after_colon):
+                        m = re.match(r'(.+?)\s*=\s*(.+)', part)
+                        if m:
+                            key = m.group(1).strip()
+                            val = m.group(2).strip()
+                            params_rows.append((key, val))
+                else:
+                    notif = f'{timestamp} — {after_colon}' if timestamp else after_colon
+                    notifications.append(notif)
+            if params_rows:
+                session['llama_init_params_rows'] = params_rows
             if notifications:
                 session['llama_init_notifications'] = notifications
     # --- КОНЕЦ ДОПОЛНИТЕЛЬНОГО ПРОХОДА ---
@@ -928,13 +920,13 @@ if __name__ == "__main__":
             # --- Параметры инициализации модели (llama_init_from_model) ---
             if session.get('llama_init_info'):
                 f.write('<details><summary>Параметры инициализации модели (llama_init_from_model)</summary>\n\n')
-                f.write('| Параметр | Значение |\n|---|---|\n')
-                for k, v in session['llama_init_params'].items():
-                    f.write(f'| {k} | {v} |\n')
+                if session.get('llama_init_params_rows'):
+                    f.write('| Параметр | Значение |\n|---|---|\n')
+                    for k, v in session['llama_init_params_rows']:
+                        f.write(f'| {k} | {v} |\n')
                 f.write('\n</details>\n')
                 if session.get('llama_init_notifications'):
-                    f.write('**Уведомления:**\n')
+                    f.write('\n### Уведомления\n\n')
                     for notif in session['llama_init_notifications']:
-                        f.write(f'- {notif}\n')
-                    f.write('\n')
+                        f.write(f'{notif}\n\n')
     print(f"Отчет '{report_file}' успешно сгенерирован.") 
