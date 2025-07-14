@@ -12,28 +12,52 @@ def parse_key_value_string(s):
     # Убираем кавычки из значений, если они есть
     return {key: value.strip('"') for key, value in matches}
 
-def get_model_name(sha, session=None):
-    """Возвращает имя модели по SHA, либо найденное в логе, либо из словаря, либо заглушку."""
-    if session and session.get('model_name_from_log'):
-        return session['model_name_from_log']
-    # Новое: если явно указано имя (пусть даже пустое)
-    if session and 'model_name' in session:
-        name = session['model_name']
-        if name:
-            return name
-        # Если имя пустое, пробуем архитектуру
-        arch = session.get('architecture')
-        if arch:
-            return f"неизвестно (архитектура: {arch})"
-        return "неизвестно"
+def get_model_name(sha, session=None, sha_to_name_manifests=None, sha_to_name_log=None):
+    """Возвращает имя модели по sha256: сначала ищет в manifests, потом в runner-блоке (сессии), потом в логе."""
     if not sha:
-        return "Неизвестная модель (SHA: N/A)"
-    model_names = {
-        "fd7b6731c33c57f61767612f56517460ec2d1e2e5a3f0163e0eb3d8d8cb5df20": "Llama-2-7B-Chat",
-        "ad361f123f771269d7eb345075f36ae03c20d7d8ffc7acd8d2db88da3b1ed846": "SmallThinker 3B Preview",
-        "ff1d1fc78170d787ee1201778e2dd65ea211654ca5fb7d69b5a2e7b123a50373": "Codegemma-7B"
-    }
-    return model_names.get(sha, f"Неизвестная модель (SHA: {sha[:12]}...)")
+        return "N/A"
+    if sha_to_name_manifests and sha in sha_to_name_manifests:
+        return sha_to_name_manifests[sha]
+    if session and session.get('model_name'):
+        return session['model_name']
+    if sha_to_name_log and sha in sha_to_name_log:
+        return sha_to_name_log[sha]
+    return f"Неизвестная модель (SHA: {sha[:12]}...)"
+
+def get_model_architecture(sha, sha_to_arch_manifests=None, session=None):
+    """Возвращает архитектуру по sha256: сначала ищет в manifests, потом в runner-блоке (сессии)."""
+    if sha_to_arch_manifests and sha in sha_to_arch_manifests:
+        return sha_to_arch_manifests[sha]
+    if session and session.get('architecture'):
+        return session['architecture']
+    return "N/A"
+
+def build_sha_to_name_map_from_manifests(manifests_root):
+    """Строит карту sha256 → имя модели по всем манифестам Ollama (универсально, без хардкодов)."""
+    import os, json
+    sha_to_name = {}
+    for root, dirs, files in os.walk(manifests_root):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            # Имя модели из пути: .../library/phi4/latest → phi4:latest
+            rel = os.path.relpath(fpath, manifests_root)
+            parts = rel.split(os.sep)
+            # ищем структуру .../<repo>/<model>/<tag>
+            if len(parts) >= 3:
+                model_name = f"{parts[-2]}:{parts[-1]}"
+            else:
+                model_name = parts[-1]
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # digest sha256 слоя модели
+                for layer in data.get('layers', []):
+                    if layer.get('mediaType', '').endswith('model') and 'sha256:' in layer.get('digest', ''):
+                        sha = layer['digest'].split('sha256:')[-1]
+                        sha_to_name[sha] = model_name
+            except Exception:
+                continue
+    return sha_to_name
 
 def build_sha_to_name_map(filtered_log_file):
     """Строит карту sha256 → имя модели (с размером) по analysis_filtered_log.txt."""
@@ -73,37 +97,40 @@ def build_sha_to_name_map(filtered_log_file):
                         break
     return sha_to_name
 
-def build_sha_to_name_map_from_manifests(manifests_root):
-    """Строит карту sha256 → имя модели по манифестам Ollama."""
-    sha_to_name = {}
+def build_sha_to_arch_map_from_manifests(manifests_root):
+    """Строит карту sha256 → архитектура по manifests Ollama."""
+    import os, json
+    sha_to_arch = {}
     for root, dirs, files in os.walk(manifests_root):
         for fname in files:
             fpath = os.path.join(root, fname)
-            # Имя модели из пути: .../library/gemma3/1b → gemma3:1b
-            rel = os.path.relpath(fpath, manifests_root)
-            parts = rel.split(os.sep)
-            if len(parts) >= 3:
-                model_name = f"{parts[-2]}:{parts[-1]}"
-            else:
-                model_name = parts[-1]
             try:
                 with open(fpath, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                # digest sha256 модели
+                # ищем архитектуру в config/labels или аналогичных полях
+                arch = None
+                if 'config' in data and 'labels' in data['config']:
+                    arch = data['config']['labels'].get('architecture')
+                if not arch:
+                    # иногда архитектура может быть в аннотациях или других полях
+                    arch = data['config'].get('architecture') if 'config' in data else None
                 for layer in data.get('layers', []):
                     if layer.get('mediaType', '').endswith('model') and 'sha256:' in layer.get('digest', ''):
                         sha = layer['digest'].split('sha256:')[-1]
-                        sha_to_name[sha] = model_name
-            except Exception as e:
+                        if arch:
+                            sha_to_arch[sha] = arch
+            except Exception:
                 continue
-    return sha_to_name
+    return sha_to_arch
 
 def parse_log(log_file, sha_to_name=None):
-    """Парсит лог-файл и возвращает список сессий (stateful: сессия начинается только по runner, VRAM loading или смене PID)."""
+    """Парсит лог-файл и возвращает список сессий (stateful: сессия начинается только по runner, VRAM loading или смене PID). Параметры (архитектура, имя и т.д.) извлекаются только из блока runner'а (20 строк после запуска)."""
     import re
     sessions = []
     current_session = None
     current_pid = None
+    runner_block_lines = 0
+    metadata_block_active = False
     with open(log_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     for i, line in enumerate(lines):
@@ -111,96 +138,115 @@ def parse_log(log_file, sha_to_name=None):
         m_pid = re.search(r'ollama\[(\d+)\]', line)
         pid = m_pid.group(1) if m_pid else None
         is_new_session = False
-        # Новая сессия по runner, VRAM loading или смене PID
+        # Новая сессия только по runner, VRAM loading или смене PID одновременно с этими событиями
         if (
             'msg="starting llama server"' in line or
-            'msg="new model will fit in available VRAM in single GPU, loading"' in line or
-            (pid and pid != current_pid)
+            'msg="new model will fit in available VRAM in single GPU, loading"' in line
         ):
             is_new_session = True
         if is_new_session:
             if current_session and (
                 current_session.get('sha256') or current_session.get('offload_info') or current_session.get('model_name') or current_session.get('model_sha256')
             ):
-                sessions.append(current_session)
+                    sessions.append(current_session)
             current_session = {'raw_lines': [], 'start_time': line.split()[0]}
             current_pid = pid
             if pid:
                 current_session['pid'] = pid
+            runner_block_lines = 20 if 'msg="starting llama server"' in line else 0
+            metadata_block_active = True
         if not current_session:
             continue  # Игнорируем строки до первой сессии
         current_session['raw_lines'].append(line)
         if pid and 'pid' not in current_session:
             current_session['pid'] = pid
-        # --- Извлекаем параметры из строки загрузки модели ---
-        if 'msg="new model will fit in available VRAM in single GPU, loading"' in line:
-            m_sha = re.search(r'sha256-([a-f0-9]{64})', line)
-            if m_sha:
-                current_session['model_sha256'] = m_sha.group(1)
-                current_session['sha256'] = m_sha.group(1)
-                current_session['sha256_extracted_from_vram_loading'] = True
-            m_gpu = re.search(r'gpu=([\w\-]+)', line)
-            if m_gpu:
-                current_session['gpu'] = m_gpu.group(1)
-            m_parallel = re.search(r'parallel=(\d+)', line)
-            if m_parallel:
-                current_session['parallel'] = m_parallel.group(1)
-            m_avail = re.search(r'available=([0-9]+)', line)
-            if m_avail:
-                current_session['vram_available'] = m_avail.group(1)
-            m_req = re.search(r'required="([^"]+)"', line)
-            if m_req:
-                current_session['vram_required'] = m_req.group(1)
-            m_model_path = re.search(r'model=([^\s]+)', line)
-            if m_model_path:
-                current_session['model_path'] = m_model_path.group(1)
-        # --- offload ---
-        if 'msg=offload' in line:
+        # --- Извлекаем параметры только из блока runner'а (20 строк после запуска) ---
+        if runner_block_lines > 0:
+            line_sha = None
+            m_sha_in_line = re.search(r'sha256-([a-f0-9]{64})', line)
+            if m_sha_in_line:
+                line_sha = m_sha_in_line.group(1)
+            sha_match = (not line_sha) or (current_session.get('sha256') and line_sha == current_session['sha256'])
+            # --- Новый блок: разрешаем сохранять параметры только из подряд идущих general.* ---
+            if metadata_block_active:
+                if 'general.name' in line:
+                    m = re.search(r'general\.name\s+str\s*=\s*(.+)$', line)
+                    if m and 'model_name' not in current_session:
+                        current_session['model_name'] = m.group(1).strip()
+                if 'general.size_label' in line:
+                    m = re.search(r'general\.size_label\s+str\s*=\s*(.+)$', line)
+                    if m and 'size_label' not in current_session:
+                        current_session['size_label'] = m.group(1).strip()
+                if 'general.architecture' in line:
+                    m = re.search(r'general\.architecture\s+str\s*=\s*(.+)$', line)
+                    if m and 'architecture' not in current_session:
+                        current_session['architecture'] = m.group(1).strip()
+                # Новый: парсим print_info: model params = ...
+                if 'print_info: model params' in line:
+                    m = re.search(r'print_info: model params\s*=\s*([\d\.]+\s*[BMK]?)', line)
+                    if m and 'params_label' not in current_session:
+                        current_session['params_label'] = m.group(1).strip()
+                # Если строка не содержит general.*, завершаем блок сбора метаданных
+                if not any(x in line for x in ['general.name', 'general.size_label', 'general.architecture', 'print_info: model params']):
+                    metadata_block_active = False
+            if 'msg="new model will fit in available VRAM in single GPU, loading"' in line:
+                m_sha = re.search(r'sha256-([a-f0-9]{64})', line)
+                if m_sha:
+                    current_session['model_sha256'] = m_sha.group(1)
+                    current_session['sha256'] = m_sha.group(1)
+                    current_session['sha256_extracted_from_vram_loading'] = True
+                m_gpu = re.search(r'gpu=([\w\-]+)', line)
+                if m_gpu:
+                    current_session['gpu'] = m_gpu.group(1)
+                m_parallel = re.search(r'parallel=(\d+)', line)
+                if m_parallel:
+                    current_session['parallel'] = m_parallel.group(1)
+                m_avail = re.search(r'available=([0-9]+)', line)
+                if m_avail:
+                    current_session['vram_available'] = m_avail.group(1)
+                m_req = re.search(r'required="([^"]+)"', line)
+                if m_req:
+                    current_session['vram_required'] = m_req.group(1)
+                m_model_path = re.search(r'model=([^\s]+)', line)
+                if m_model_path:
+                    current_session['model_path'] = m_model_path.group(1)
+            if 'msg=offload' in line:
                 offload_str = line.split('msg=offload ')[1]
                 current_session['offload_info'] = parse_key_value_string(offload_str)
-        # --- general.name ---
-        if 'general.name' in line:
-            m = re.search(r'general\.name\s+str\s*=\s*(.+)$', line)
-            if m:
-                current_session['model_name'] = m.group(1).strip()
-        # --- general.size_label ---
-        if 'general.size_label' in line:
-            m = re.search(r'general\.size_label\s+str\s*=\s*(.+)$', line)
-            if m:
-                current_session['size_label'] = m.group(1).strip()
-        # --- general.architecture ---
-        if 'general.architecture' in line:
-            m = re.search(r'general\.architecture\s+str\s*=\s*(.+)$', line)
-            if m:
-                current_session['architecture'] = m.group(1).strip()
-        # --- starting llama server ---
-        if 'msg="starting llama server"' in line:
-            cmd_str = line.split('cmd=')[1].strip().strip('"')
-            cmd_parts = cmd_str.split()
-            params = {}
-            for j, part in enumerate(cmd_parts):
-                if part.startswith('--') and j + 1 < len(cmd_parts):
-                    params[part] = cmd_parts[j+1]
-            model_path = params.get('--model', '')
-            sha = model_path.split('sha256-')[-1] if 'sha256-' in model_path else None
-            current_session['sha256'] = sha
-            current_session['ctx_size'] = params.get('--ctx-size', 'N/A')
-            current_session['batch_size'] = params.get('--batch-size', 'N/A')
-            current_session['gpu_layers'] = params.get('--n-gpu-layers', 'N/A')
-            current_session['threads'] = params.get('--threads', 'N/A')
-            current_session['parallel'] = params.get('--parallel', 'N/A')
-            current_session['port'] = params.get('--port', 'N/A')
-            # Имя из карты sha->имя
-            if sha_to_name and sha in sha_to_name:
-                current_session['model_name'] = sha_to_name[sha]
-        # --- runner started ---
-        if 'msg="llama runner started' in line:
+            if 'msg="starting llama server"' in line:
+                cmd_str = line.split('cmd=')[1].strip().strip('"')
+                cmd_parts = cmd_str.split()
+                params = {}
+                for j, part in enumerate(cmd_parts):
+                    if part.startswith('--') and j + 1 < len(cmd_parts):
+                        params[part] = cmd_parts[j+1]
+                model_path = params.get('--model', '')
+                sha = model_path.split('sha256-')[-1] if 'sha256-' in model_path else None
+                current_session['sha256'] = sha
+                current_session['ctx_size'] = params.get('--ctx-size', 'N/A')
+                current_session['batch_size'] = params.get('--batch-size', 'N/A')
+                current_session['gpu_layers'] = params.get('--n-gpu-layers', 'N/A')
+                current_session['threads'] = params.get('--threads', 'N/A')
+                current_session['parallel'] = params.get('--parallel', 'N/A')
+                current_session['port'] = params.get('--port', 'N/A')
+                if sha_to_name and sha in sha_to_name:
+                    current_session['model_name'] = sha_to_name[sha]
+            if 'msg="llama runner started' in line:
                 time_str = line.split(' in ')[-1].split(' seconds')[0]
                 current_session['runner_start_time'] = f"{time_str} s"
-    # Добавляем последнюю сессию, если она не пуста
+            runner_block_lines -= 1
+        # --- вне блока runner'а не извлекаем параметры ---
     if current_session and (
         current_session.get('sha256') or current_session.get('offload_info') or current_session.get('model_name') or current_session.get('model_sha256')
     ):
+        # --- ДОБАВЛЕНО: ищем model params по всей сессии, если не найдено в блоке runner'а ---
+        if 'params_label' not in current_session:
+            import re
+            for l in current_session.get('raw_lines', []):
+                m = re.search(r'model params\s*=\s*([\d\.]+\s*[ ]*[BMKbmkg])', l, re.IGNORECASE)
+                if m:
+                    current_session['params_label'] = m.group(1).strip()
+                    break
         sessions.append(current_session)
     return sessions
 
@@ -498,6 +544,56 @@ def assign_requests_to_sessions(sessions, requests):
             del s['_dt']
     return sessions
 
+def build_sha_to_size_map_from_manifests(manifests_root):
+    """Строит карту sha256 → размер модели по всем манифестам Ollama (берёт максимальный size среди всех слоёв с данным sha256)."""
+    import os, json
+    sha_to_size = {}
+    for root, dirs, files in os.walk(manifests_root):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for layer in data.get('layers', []):
+                    if layer.get('mediaType', '').endswith('model') and 'sha256:' in layer.get('digest', ''):
+                        sha = layer['digest'].split('sha256:')[-1]
+                        size = layer.get('size', None)
+                        if size is not None:
+                            if sha not in sha_to_size or size > sha_to_size[sha]:
+                                sha_to_size[sha] = size
+            except Exception:
+                continue
+    return sha_to_size
+
+def collect_ollama_models(manifests_root):
+    """Собирает список всех моделей Ollama из manifests: имя, sha256, размер."""
+    import os, json
+    models = []
+    for root, dirs, files in os.walk(manifests_root):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, manifests_root)
+            parts = rel.split(os.sep)
+            if len(parts) >= 3:
+                model_name = f"{parts[-2]}:{parts[-1]}"
+            else:
+                model_name = parts[-1]
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for layer in data.get('layers', []):
+                    if layer.get('mediaType', '').endswith('model') and 'sha256:' in layer.get('digest', ''):
+                        sha = layer['digest'].split('sha256:')[-1]
+                        size = layer.get('size', None)
+                        models.append({
+                            'name': model_name,
+                            'sha256': sha,
+                            'size': size
+                        })
+            except Exception:
+                continue
+    return models
+
 
 if __name__ == "__main__":
     # 1. Сохраняем логи за 120 минут
@@ -509,9 +605,16 @@ if __name__ == "__main__":
     dump_file = os.path.join('reports', 'ollama_log_dump.txt')
     filter_log(dump_file, filtered_log)
     # 4. Строим карту sha256 → имя модели по analysis_filtered_log.txt
-    sha_to_name = build_sha_to_name_map(filtered_log)
+    sha_to_name_log = build_sha_to_name_map(filtered_log)
     manifests_root = os.path.join('/root/.ollama/models/manifests')
-    sha_to_name.update(build_sha_to_name_map_from_manifests(manifests_root))
+    sha_to_name_manifests = build_sha_to_name_map_from_manifests(manifests_root)
+    sha_to_arch_manifests = build_sha_to_arch_map_from_manifests(manifests_root)
+    sha_to_size_manifests = build_sha_to_size_map_from_manifests(manifests_root)
+    # Итоговая карта: приоритет у manifests
+    sha_to_name = dict(sha_to_name_manifests)
+    for k, v in sha_to_name_log.items():
+        if k not in sha_to_name:
+            sha_to_name[k] = v
     # 5. Анализируем очищенный лог и генерируем отчёт
     parsed_sessions = parse_log(filtered_log, sha_to_name)
 
@@ -526,6 +629,25 @@ if __name__ == "__main__":
     report_file = os.path.join('reports', 'report.md')
     with open(report_file, 'w', encoding='utf-8') as f:
         f.write("# Анализ работы Ollama\n\n")
+        # --- Список моделей Ollama ---
+        manifests_root = os.path.join('/root/.ollama/models/manifests')
+        ollama_models = collect_ollama_models(manifests_root)
+        if ollama_models:
+            f.write("## Список моделей Ollama (по manifests)\n\n")
+            f.write("| Модель | SHA256 | Размер |\n")
+            f.write("|--------|------------------------------------------|--------|\n")
+            for m in ollama_models:
+                sz = m['size']
+                if sz is None:
+                    sz_str = ''
+                elif sz > 1024**3:
+                    sz_str = f"{sz//1024//1024//1024} GB"
+                elif sz > 1024**2:
+                    sz_str = f"{sz//1024//1024} MB"
+                else:
+                    sz_str = f"{sz} B"
+                f.write(f"| {m['name']} | {m['sha256']} | {sz_str} |\n")
+            f.write("\n")
         # --- События старта ---
         if systemd_events:
             f.write("## Системные события\n\n")
@@ -555,15 +677,31 @@ if __name__ == "__main__":
                     f.write("\n")
         # --- Сессии моделей ---
         for i, session in enumerate(parsed_sessions):
-            model_name = get_model_name(session.get('sha256'), session)
+            model_name = get_model_name(session.get('sha256'), session, sha_to_name_manifests, sha_to_name_log)
+            architecture = get_model_architecture(session.get('sha256'), sha_to_arch_manifests, session)
+            size_label = session.get('size_label', 'N/A')
+            sha = session.get('sha256')
+            size_bytes = sha_to_size_manifests.get(sha) if sha else None
+            if size_bytes is not None:
+                if size_bytes > 1024**3:
+                    size_str = f"{size_bytes//1024//1024//1024} GB"
+                elif size_bytes > 1024**2:
+                    size_str = f"{size_bytes//1024//1024} MB"
+                elif size_bytes > 1024:
+                    size_str = f"{size_bytes//1024} KB"
+                else:
+                    size_str = f"{size_bytes} B"
+            else:
+                size_str = None
             f.write(f"## Сессия {i+1}: {model_name}\n\n")
             f.write(f"*   **Время старта сессии:** {session.get('start_time', 'N/A')}\n")
             f.write(f"*   **PID процесса Ollama:** {session.get('pid', 'N/A')}\n")
             f.write(f"*   **Модель:** {model_name}\n")
-            f.write(f"*   **SHA256:** {session.get('sha256', 'N/A')}\n")
-            if session.get('sha256_extracted_from_vram_loading'):
-                f.write(f"*   _SHA256 извлечён из строки VRAM loading, runner не запускался_\n")
-            f.write(f"*   **Архитектура:** {session.get('architecture', 'N/A')}\n")
+            f.write(f"*   **SHA256:** {session.get('sha256', 'N/A')}")
+            if model_name and not model_name.startswith("Неизвестная модель") and model_name != "N/A":
+                f.write(f" ({model_name})")
+            f.write("\n")
+            f.write(f"*   **Архитектура:** {architecture}\n")
             # GPU: собираем все параметры из offload_info
             gpu_info = []
             offload = session.get('offload_info', {})
@@ -600,7 +738,20 @@ if __name__ == "__main__":
                 f.write(f"*   **VRAM свободно:** {session.get('vram_available')}\n")
             if session.get('vram_required', 'N/A') != 'N/A':
                 f.write(f"*   **VRAM требуется:** {session.get('vram_required')}\n")
-            f.write(f"*   **Размер модели:** {session.get('size_label', 'N/A')}\n\n")
+            # Вместо строки с size_label/size_str
+            params_label = session.get('params_label')
+            if params_label and size_str:
+                f.write(f"*   **Размер модели:** {params_label} ({size_str})\n")
+            elif params_label:
+                f.write(f"*   **Размер модели:** {params_label}\n")
+            elif size_label != 'N/A' and size_str:
+                f.write(f"*   **Размер модели:** {size_label} ({size_str})\n")
+            elif size_label != 'N/A':
+                f.write(f"*   **Размер модели:** {size_label}\n")
+            elif size_str:
+                f.write(f"*   **Размер модели:** {size_str}\n")
+            else:
+                f.write(f"*   **Размер модели:** N/A\n")
 
             f.write("### Свободная память при старте:\n\n")
             ram_free = session.get('ram_free', 'N/A')
