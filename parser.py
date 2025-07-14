@@ -379,7 +379,8 @@ def filter_log(input_file, output_file):
                 "general.size_label",
                 "architecture=",
                 "general.architecture",
-                "print_info: model params"  # <--- ДОБАВЛЕНО!
+                "print_info: model params",
+                "llama_init_from_model"  # <--- ДОБАВЛЕНО!
             ]):
                 fout.write(line)
             elif "[GIN]" in line:
@@ -708,6 +709,57 @@ if __name__ == "__main__":
                 break
     # --- КОНЕЦ ДОПОЛНИТЕЛЬНОГО ПРОХОДА ---
 
+    # --- ДОПОЛНИТЕЛЬНЫЙ ПРОХОД: собираем все строки llama_init_from_model для каждой сессии ---
+    for session in parsed_sessions:
+        raw_lines = session.get('raw_lines', [])
+        llama_init_info = [l.strip() for l in raw_lines if 'llama_init_from_model' in l]
+        if llama_init_info:
+            session['llama_init_info'] = llama_init_info
+    # --- КОНЕЦ ДОПОЛНИТЕЛЬНОГО ПРОХОДА ---
+
+    # --- ДОПОЛНИТЕЛЬНЫЙ ПРОХОД: строгий парсинг параметров и уведомлений из llama_init_from_model ---
+    import re
+    for session in parsed_sessions:
+        raw_lines = session.get('raw_lines', [])
+        llama_init_info = [l.strip() for l in raw_lines if 'llama_init_from_model' in l]
+        if llama_init_info:
+            params = {}
+            notifications = []
+            for l in llama_init_info:
+                found_param = False
+                # Ищем все пары ключ=значение или ключ:значение (в строке может быть несколько пар через запятую)
+                for part in re.split(r',\s*', l):
+                    # Ключ — только буквы/цифры/скобки/подчёркивания, без пробелов и без даты
+                    m = re.search(r'llama_init_from_model:\s*([\w\(\)_]+)\s*[=:]\s*(.+)', part)
+                    if m:
+                        key = m.group(1).strip()
+                        val = m.group(2).strip()
+                        params[key] = val
+                        found_param = True
+                    else:
+                        # Для остальных пар внутри строки (без префикса llama_init_from_model:)
+                        m2 = re.search(r'^([\w\(\)_]+)\s*[=:]\s*(.+)', part)
+                        if m2:
+                            key = m2.group(1).strip()
+                            val = m2.group(2).strip()
+                            params[key] = val
+                            found_param = True
+                # Если не найдено ни одной пары — это уведомление
+                if not found_param:
+                    notif = l.split('llama_init_from_model:')[-1].strip()
+                    if notif:
+                        notifications.append(notif)
+                # Спец. случай: n_ctx_per_seq (2048) < n_ctx_train (8192)
+                m3 = re.search(r'n_ctx_per_seq \((\d+)\) < n_ctx_train \((\d+)\)', l)
+                if m3:
+                    params['n_ctx_per_seq'] = m3.group(1)
+                    params['n_ctx_train'] = m3.group(2)
+            if params:
+                session['llama_init_params'] = params
+            if notifications:
+                session['llama_init_notifications'] = notifications
+    # --- КОНЕЦ ДОПОЛНИТЕЛЬНОГО ПРОХОДА ---
+
     # Новый шаг: парсим GIN-запросы и привязываем к сессиям
     gin_requests = parse_gin_requests(dump_file)
     parsed_sessions = assign_requests_to_sessions(parsed_sessions, gin_requests)
@@ -872,4 +924,17 @@ if __name__ == "__main__":
             else:
                 f.write("(нет запросов в этой сессии)\n")
             f.write("---\n\n")
+
+            # --- Параметры инициализации модели (llama_init_from_model) ---
+            if session.get('llama_init_info'):
+                f.write('<details><summary>Параметры инициализации модели (llama_init_from_model)</summary>\n\n')
+                f.write('| Параметр | Значение |\n|---|---|\n')
+                for k, v in session['llama_init_params'].items():
+                    f.write(f'| {k} | {v} |\n')
+                f.write('\n</details>\n')
+                if session.get('llama_init_notifications'):
+                    f.write('**Уведомления:**\n')
+                    for notif in session['llama_init_notifications']:
+                        f.write(f'- {notif}\n')
+                    f.write('\n')
     print(f"Отчет '{report_file}' успешно сгенерирован.") 
