@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ollama Log Exporter for Prometheus
+Ollama Log Exporter for Prometheus (New Version)
 
-Scans Ollama manifest files and runner processes to provide accurate, real-time
-Prometheus metrics for model usage, resource consumption, and API latency.
+Real-time session-based exporter that uses the same stateful logic as the parser
+for accurate and comprehensive Prometheus metrics.
 """
 
 import json
@@ -12,193 +12,746 @@ import locale
 import logging
 import os
 import re
-import locale
 import time
 import threading
-import psutil
-import os
-os.environ['LANG'] = 'C'
-os.environ['LC_ALL'] = 'C'
-import xml.etree.ElementTree as ET
 import subprocess
 import shlex
 import argparse
-from prometheus_client import start_http_server, Counter, Gauge, Histogram
+from datetime import datetime
+from prometheus_client import start_http_server, Counter, Gauge, Histogram, Info
+
+# Set environment for consistent output
+os.environ['LANG'] = 'C'
+os.environ['LC_ALL'] = 'C'
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Configuration ---
 JOURNALCTL_UNIT = "ollama.service"
 MODEL_MAP_UPDATE_INTERVAL = 300  # 5 minutes
-PROCESS_METRICS_UPDATE_INTERVAL = 5 # 5 seconds
-LOG_COMMAND = f"journalctl -u {JOURNALCTL_UNIT} -f -n 0"
+LOG_COMMAND = f"journalctl -u {JOURNALCTL_UNIT} -f -n 10"
 
-# --- Metrics ---
+# --- Prometheus Metrics ---
+# Request metrics
 OLLAMA_REQUESTS_TOTAL = Counter(
     'ollama_requests_total',
     'Total number of requests to Ollama API',
-    ['model', 'endpoint', 'session_id']
+    ['model', 'endpoint', 'method', 'status', 'session_id']
 )
+
 OLLAMA_REQUEST_LATENCY = Histogram(
     'ollama_request_latency_seconds',
     'Request latency for Ollama API',
-    ['model', 'path', 'method', 'session_id']
-)
-OLLAMA_RUNNER_MEMORY_BYTES = Gauge(
-    'ollama_runner_memory_bytes',
-    'Memory usage of Ollama runner processes in bytes',
-    ['model']
-)
-OLLAMA_RUNNER_CPU_USAGE_PERCENT = Gauge(
-    'ollama_runner_cpu_usage_percent',
-    'CPU usage of Ollama runner processes in percent',
-    ['model']
+    ['model', 'endpoint', 'method', 'session_id']
 )
 
-# --- Model & Resource Metrics ---
-OLLAMA_MODEL_INFO = Gauge(
-    'ollama_model_info',
-    'Detailed information about a loaded model',
-    ['model', 'pid', 'quantization', 'params_billion', 'n_ctx', 'gpu_layers']
-)
-OLLAMA_MODEL_VRAM_BUFFER_BYTES = Gauge(
-    'ollama_model_vram_buffer_bytes',
-    'VRAM used by the model buffer',
-    ['model', 'pid']
-)
-OLLAMA_MODEL_VRAM_KV_CACHE_BYTES = Gauge(
-    'ollama_model_vram_kv_cache_bytes',
-    'VRAM used by the KV cache',
-    ['model', 'pid']
-)
-OLLAMA_MODEL_ACTIVE = Gauge(
-    'ollama_model_active',
-    'Indicates if a model runner process is currently active',
-    ['model', 'pid']
-)
-OLLAMA_MODEL_RAM_USAGE_BYTES = Gauge(
-    'ollama_model_ram_usage_bytes',
-    'RAM usage of a model runner process',
-    ['model', 'pid']
+# Session metrics
+OLLAMA_SESSION_INFO = Info(
+    'ollama_session_info',
+    'Information about active Ollama sessions',
+    ['session_id', 'model', 'pid']
 )
 
-# --- GPU Hardware Metrics (from Ollama Logs) ---
-OLLAMA_GPU_INFO = Gauge(
-    'ollama_gpu_info',
-    'Static information about the GPU used by Ollama for inference',
-    ['gpu_id', 'gpu_name', 'gpu_library', 'gpu_variant', 'gpu_compute', 'gpu_driver']
+OLLAMA_SESSION_START_TIME = Gauge(
+    'ollama_session_start_timestamp_seconds',
+    'Unix timestamp when session started',
+    ['model', 'session_id', 'pid']
 )
+
+OLLAMA_SESSION_RUNNER_START_TIME = Gauge(
+    'ollama_session_runner_start_seconds',
+    'Time taken to start the runner in seconds',
+    ['model', 'session_id', 'pid']
+)
+
+# Model configuration metrics
+OLLAMA_MODEL_CONTEXT_SIZE = Gauge(
+    'ollama_model_context_size',
+    'Context size configured for the model',
+    ['model', 'session_id', 'pid']
+)
+
+OLLAMA_MODEL_BATCH_SIZE = Gauge(
+    'ollama_model_batch_size',
+    'Batch size configured for the model',
+    ['model', 'session_id', 'pid']
+)
+
+OLLAMA_MODEL_GPU_LAYERS = Gauge(
+    'ollama_model_gpu_layers',
+    'Number of GPU layers for the model',
+    ['model', 'session_id', 'pid']
+)
+
+OLLAMA_MODEL_THREADS = Gauge(
+    'ollama_model_threads',
+    'Number of threads configured for the model',
+    ['model', 'session_id', 'pid']
+)
+
+OLLAMA_MODEL_PARALLEL = Gauge(
+    'ollama_model_parallel_requests',
+    'Number of parallel requests configured',
+    ['model', 'session_id', 'pid']
+)
+
+# VRAM and memory metrics
+OLLAMA_MODEL_VRAM_AVAILABLE_BYTES = Gauge(
+    'ollama_model_vram_available_bytes',
+    'Available VRAM when model was loaded',
+    ['model', 'session_id', 'pid', 'gpu']
+)
+
+OLLAMA_MODEL_VRAM_REQUIRED_BYTES = Gauge(
+    'ollama_model_vram_required_bytes',
+    'VRAM required by the model',
+    ['model', 'session_id', 'pid', 'gpu']
+)
+
+# Offload metrics
+OLLAMA_MODEL_LAYERS_TOTAL = Gauge(
+    'ollama_model_layers_total',
+    'Total number of model layers',
+    ['model', 'session_id', 'pid']
+)
+
+OLLAMA_MODEL_LAYERS_OFFLOADED = Gauge(
+    'ollama_model_layers_offloaded',
+    'Number of layers offloaded to GPU',
+    ['model', 'session_id', 'pid']
+)
+
+OLLAMA_MODEL_MEMORY_REQUIRED_FULL_BYTES = Gauge(
+    'ollama_model_memory_required_full_bytes',
+    'Full memory required by model',
+    ['model', 'session_id', 'pid']
+)
+
+OLLAMA_MODEL_MEMORY_REQUIRED_KV_BYTES = Gauge(
+    'ollama_model_memory_required_kv_bytes',
+    'Memory required for KV cache',
+    ['model', 'session_id', 'pid']
+)
+
+# Session activity
+OLLAMA_SESSION_ACTIVE = Gauge(
+    'ollama_session_active',
+    'Whether the session is currently active (1) or not (0)',
+    ['model', 'session_id', 'pid']
+)
+
+# System info metrics
+OLLAMA_SYSTEM_INFO = Info(
+    'ollama_system_info',
+    'Information about Ollama system and service',
+    ['service_status', 'version', 'port']
+)
+
+OLLAMA_GPU_INFO = Info(
+    'ollama_gpu_info', 
+    'Information about GPU used by Ollama',
+    ['gpu_id', 'gpu_name', 'library', 'variant', 'compute', 'driver']
+)
+
 OLLAMA_GPU_VRAM_TOTAL_BYTES = Gauge(
     'ollama_gpu_vram_total_bytes',
-    'Total VRAM on the GPU as reported by Ollama',
+    'Total VRAM on GPU in bytes',
     ['gpu_id', 'gpu_name']
 )
+
 OLLAMA_GPU_VRAM_AVAILABLE_BYTES = Gauge(
-    'ollama_gpu_vram_available_bytes',
-    'Available VRAM on the GPU at inference time as reported by Ollama',
+    'ollama_gpu_vram_available_bytes', 
+    'Available VRAM on GPU in bytes',
     ['gpu_id', 'gpu_name']
 )
 
-# --- GPU Hardware Metrics (from NVML) ---
-OLLAMA_GPU_UTILIZATION_PERCENT = Gauge(
-    'ollama_gpu_utilization_percent',
-    'GPU utilization percentage',
-    ['gpu_uuid']
-)
-OLLAMA_GPU_MEMORY_USAGE_PERCENT = Gauge(
-    'ollama_gpu_memory_usage_percent',
-    'GPU memory usage percentage',
-    ['gpu_uuid']
+OLLAMA_SERVICE_START_TIME = Gauge(
+    'ollama_service_start_timestamp_seconds',
+    'Unix timestamp when Ollama service was started'
 )
 
-# --- Global State ---
-# model_map will hold the mapping from { "blob_digest": "model_name" }
-model_map = {}
-# pid_model_cache will hold the mapping from { "pid": { "model_name": "...", "quantization": "...", ... } }
-pid_model_cache = {}
-# Global sets to track processed entities
-processed_gpus = set()  # GPUs we have already exported info for
-# Keep track of active runner processes to clean up metrics
-active_runners = set()
+OLLAMA_SERVICE_RESTARTS_TOTAL = Counter(
+    'ollama_service_restarts_total',
+    'Total number of Ollama service restarts'
+)
 
-# Set locale to handle Russian month names
-try:
-    locale.setlocale(locale.LC_TIME, 'ru_RU.UTF-8')
-except locale.Error:
-    try:
-        locale.setlocale(locale.LC_TIME, 'Russian_Russia.1251')
-    except locale.Error:
-        logging.warning("Could not set Russian locale. Log timestamp parsing might fail.")
+# Global state
+model_map = {}  # SHA256 -> model_name mapping
+active_sessions = {}  # session_id -> session_data mapping
+processed_requests = set()  # To avoid duplicate request processing
+system_info_collected = False  # Flag to avoid re-collecting system info
 
-MODELS_PATH_RE = re.compile(r'OLLAMA_MODELS:(\S+)')
 
-def find_models_path_from_journal():
-    """Scans journal logs for the OLLAMA_MODELS env var to find the models path."""
-    try:
-        logging.info("Scanning journal logs for OLLAMA_MODELS path (searching from newest to oldest)...")
-        env = os.environ.copy()
-        env['LANG'] = 'C.UTF-8'
-        env['LC_ALL'] = 'C.UTF-8'
-
-        process = subprocess.Popen(
-            ['journalctl', '-u', JOURNALCTL_UNIT, '--no-pager', '--output=cat', '-r'],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', env=env
+class OllamaSession:
+    """Represents an Ollama session with all its metadata and state"""
+    
+    def __init__(self, session_id, start_time, pid=None):
+        self.session_id = session_id
+        self.start_time = start_time
+        self.pid = pid
+        self.raw_lines = []
+        
+        # Model information
+        self.model_name = None
+        self.sha256 = None
+        self.model_sha256 = None
+        self.architecture = None
+        self.size_label = None
+        self.params_label = None
+        self.file_size_label = None
+        
+        # Configuration parameters
+        self.ctx_size = None
+        self.batch_size = None
+        self.gpu_layers = None
+        self.threads = None
+        self.parallel = None
+        self.port = None
+        
+        # VRAM and GPU info
+        self.gpu = None
+        self.vram_available = None
+        self.vram_required = None
+        self.model_path = None
+        
+        # Offload information
+        self.offload_info = {}
+        
+        # Runtime info
+        self.runner_start_time = None
+        self.gin_requests = []
+        
+        # State tracking
+        self.runner_block_lines = 0
+        self.metadata_block_active = False
+        self.sha256_extracted_from_vram_loading = False
+        
+    def get_model_name(self):
+        """Get the best available model name"""
+        if self.model_name:
+            return self.model_name
+        
+        sha = self.sha256 or self.model_sha256
+        if sha and sha in model_map:
+            return model_map[sha]
+            
+        if sha:
+            return f"unknown:{sha[:12]}"
+            
+        return "unknown"
+    
+    def is_valid_session(self):
+        """Check if session has enough data to be considered valid"""
+        return bool(
+            self.sha256 or 
+            self.model_sha256 or 
+            self.model_name or 
+            self.offload_info
         )
+    
+    def to_dict(self):
+        """Convert session to dictionary for logging/debugging"""
+        return {
+            'session_id': self.session_id,
+            'pid': self.pid,
+            'model_name': self.get_model_name(),
+            'sha256': self.sha256 or self.model_sha256,
+            'ctx_size': self.ctx_size,
+            'gpu_layers': self.gpu_layers,
+            'vram_available': self.vram_available,
+            'requests_count': len(self.gin_requests)
+        }
 
-        for line in iter(process.stdout.readline, ''):
-            if not line:
-                break
-            # Look for the server config log line containing the models path definition
-            if 'OLLAMA_MODELS:' in line:
-                m = MODELS_PATH_RE.search(line)
-                if m:
-                    models_path = m.group(1)
-                    # The path might have trailing characters like ']' or '"', clean it up.
-                    models_path = models_path.strip(']"')
-                    logging.info(f"Found Ollama models path from server config log: {models_path}")
-                    process.terminate()
-                    return models_path
 
-        process.wait()
-        logging.warning("Could not find OLLAMA_MODELS path in any Ollama journal entries.")
-        return None
-    except FileNotFoundError:
-        logging.error("journalctl command not found. Ensure systemd is used and 'journalctl' is in the system's PATH.")
-        return None
-    except subprocess.CalledProcessError as e:
-        # This can happen if the service doesn't exist, which is a valid case
-        logging.warning(f"Could not read journal for '{JOURNALCTL_UNIT}'. Maybe it's not running? Error: {e.stderr}")
-        return None
-    except Exception as e:
-        logging.error(f"An unexpected error occurred while searching for models path: {e}")
-        return None
+class SessionTracker:
+    """Tracks Ollama sessions in real-time using parser logic"""
+    
+    def __init__(self):
+        self.current_session = None
+        self.sessions = {}
+        self.param_buffer = []
+        self.session_counter = 0
+        
+    def parse_key_value_string(self, s):
+        """Parse key=value pairs from log string"""
+        pattern = r'(\w+(?:\.\w+)*)=("\[.*?\]"|\[.*?\]|"[^"]*"|[\w\./\:-]+)'
+        matches = re.findall(pattern, s)
+        return {key: value.strip('"') for key, value in matches}
+    
+    def parse_duration(self, duration_str):
+        """Convert duration string to seconds"""
+        val = float(re.findall(r'[\d\.]+', duration_str)[0])
+        if 'µs' in duration_str:
+            return val / 1_000_000
+        if 'ms' in duration_str:
+            return val / 1_000
+        if 'm' in duration_str:
+            return val * 60
+        if 'h' in duration_str:
+            return val * 3600
+        return val
+    
+    def process_line(self, line):
+        """Process a single log line using parser logic"""
+        # Buffer model params lines
+        if 'print_info: model params' in line:
+            self.param_buffer.append(line)
+        
+        # Extract PID
+        m_pid = re.search(r'ollama\[(\d+)\]', line)
+        pid = m_pid.group(1) if m_pid else None
+        
+        # Check for new session triggers
+        is_new_session = (
+            'msg="starting llama server"' in line or
+            'msg="new model will fit in available VRAM in single GPU, loading"' in line
+        )
+        
+        if is_new_session:
+            # Finalize current session
+            if self.current_session and self.current_session.is_valid_session():
+                self.sessions[self.current_session.session_id] = self.current_session
+                self._export_session_metrics(self.current_session)
+            
+            # Create new session
+            self.session_counter += 1
+            session_id = f"session_{self.session_counter}_{pid or 'unknown'}"
+            start_time = line.split()[0] if line.split() else str(datetime.now())
+            
+            self.current_session = OllamaSession(session_id, start_time, pid)
+            
+            # Add buffered params to new session
+            if self.param_buffer:
+                self.current_session.raw_lines.extend(self.param_buffer)
+                self.param_buffer = []
+            
+            # Set runner block processing
+            if 'msg="starting llama server"' in line:
+                self.current_session.runner_block_lines = 20
+                self.current_session.metadata_block_active = True
+        
+        if not self.current_session:
+            return
+        
+        # Add line to current session
+        self.current_session.raw_lines.append(line)
+        
+        # Update PID if found
+        if pid and not self.current_session.pid:
+            self.current_session.pid = pid
+        
+        # Process runner block (20 lines after starting llama server)
+        if self.current_session.runner_block_lines > 0:
+            self._process_runner_block_line(line)
+            self.current_session.runner_block_lines -= 1
+        
+        # Process GIN requests
+        if '[GIN]' in line:
+            logging.info(f"About to process GIN request: {line.strip()}")
+        self._process_gin_request(line)
+    
+    def _process_runner_block_line(self, line):
+        """Process lines within the runner block (20 lines after server start)"""
+        session = self.current_session
+        
+        # Extract metadata while block is active
+        if session.metadata_block_active:
+            if 'general.name' in line:
+                m = re.search(r'general\.name\s+str\s*=\s*(.+)', line)
+                if m and not session.model_name:
+                    session.model_name = m.group(1).strip()
+            
+            elif 'general.size_label' in line:
+                m = re.search(r'general\.size_label\s+str\s*=\s*(.+)', line)
+                if m and not session.size_label:
+                    session.size_label = m.group(1).strip()
+            
+            elif 'general.architecture' in line:
+                m = re.search(r'general\.architecture\s+str\s*=\s*(.+)', line)
+                if m and not session.architecture:
+                    session.architecture = m.group(1).strip()
+            
+            elif 'print_info: model params' in line:
+                m = re.search(r'print_info: model params\s*=\s*([\d\.]+\s*[BMKbmkg])', line)
+                if m and not session.params_label:
+                    session.params_label = m.group(1).strip()
+            
+            elif 'print_info: file size' in line:
+                m = re.search(r'print_info: file size\s*=\s*([\d\.]+\s*[GMK]i?B)', line)
+                if not m:
+                    m = re.search(r'print_info: file size\s*=\s*([^\(]+)', line)
+                if m and not session.file_size_label:
+                    session.file_size_label = m.group(1).strip().split('(')[0].strip()
+            
+            # End metadata block if no relevant content
+            elif not any(x in line for x in ['general.name', 'general.size_label', 'general.architecture', 'print_info: model params']):
+                session.metadata_block_active = False
+        
+        # Process VRAM loading
+        if 'msg="new model will fit in available VRAM in single GPU, loading"' in line:
+            m_sha = re.search(r'sha256-([a-f0-9]{64})', line)
+            if m_sha:
+                session.model_sha256 = m_sha.group(1)
+                session.sha256 = m_sha.group(1)
+                session.sha256_extracted_from_vram_loading = True
+            
+            m_gpu = re.search(r'gpu=([\w\-]+)', line)
+            if m_gpu:
+                session.gpu = m_gpu.group(1)
+            
+            m_parallel = re.search(r'parallel=(\d+)', line)
+            if m_parallel:
+                session.parallel = m_parallel.group(1)
+            
+            m_avail = re.search(r'available=([0-9]+)', line)
+            if m_avail:
+                session.vram_available = m_avail.group(1)
+            
+            m_req = re.search(r'required="([^"]+)"', line)
+            if m_req:
+                session.vram_required = m_req.group(1)
+            
+            m_model_path = re.search(r'model=([^\s]+)', line)
+            if m_model_path:
+                session.model_path = m_model_path.group(1)
+        
+        # Process offload info
+        elif 'msg=offload' in line:
+            offload_str = line.split('msg=offload ')[1]
+            session.offload_info = self.parse_key_value_string(offload_str)
+        
+        # Process starting llama server
+        elif 'msg="starting llama server"' in line:
+            cmd_str = line.split('cmd=')[1].strip().strip('"')
+            cmd_parts = cmd_str.split()
+            params = {}
+            
+            for j, part in enumerate(cmd_parts):
+                if part.startswith('--') and j + 1 < len(cmd_parts):
+                    params[part] = cmd_parts[j+1]
+            
+            model_path = params.get('--model', '')
+            sha = model_path.split('sha256-')[-1] if 'sha256-' in model_path else None
+            
+            session.sha256 = sha
+            session.ctx_size = params.get('--ctx-size', 'N/A')
+            session.batch_size = params.get('--batch-size', 'N/A')
+            session.gpu_layers = params.get('--n-gpu-layers', 'N/A')
+            session.threads = params.get('--threads', 'N/A')
+            session.parallel = params.get('--parallel', 'N/A')
+            session.port = params.get('--port', 'N/A')
+        
+        # Process runner start time
+        elif 'msg="llama runner started' in line:
+            time_str = line.split(' in ')[-1].split(' seconds')[0]
+            session.runner_start_time = f"{time_str} s"
+    
+    def _process_gin_request(self, line):
+        """Process GIN request lines"""
+        if '[GIN]' not in line:
+            return
+        
+        # Extract PID from line
+        m_pid = re.search(r'ollama\[(\d+)\]', line)
+        pid = m_pid.group(1) if m_pid else None
+        
+        # Parse GIN request
+        gin_pattern = re.compile(r'^([\d\-:T\+]+)\s+[^:]+: \[GIN\]\s+(\d{4}/\d{2}/\d{2} - \d{2}:\d{2}:\d{2}) \| (\d+) \| ([^|]+) \|\s*([^|]+) \|\s*(\w+)\s+"([^"]+)"')
+        m = gin_pattern.search(line)
+        
+        if m:
+            journal_time = m.group(1).strip()
+            status = m.group(3).strip()
+            latency = m.group(4).strip()
+            ip = m.group(5).strip()
+            method = m.group(6).strip()
+            path = m.group(7).strip()
+            
+            request_data = {
+                'journal_time': journal_time,
+                'status': status,
+                'latency': latency,
+                'ip': ip,
+                'method': method,
+                'path': path,
+                'raw_line': line.strip()
+            }
+            
+            # Find the session for this PID
+            target_session = None
+            
+            # First try current session
+            if self.current_session and self.current_session.pid == pid:
+                target_session = self.current_session
+            else:
+                # Look for existing session with this PID
+                for session in self.sessions.values():
+                    if session.pid == pid:
+                        target_session = session
+                        break
+            
+            # If no session found, create a minimal session for this PID
+            if not target_session and pid:
+                self.session_counter += 1
+                session_id = f"session_{self.session_counter}_{pid}_gin_only"
+                target_session = OllamaSession(session_id, journal_time, pid)
+                target_session.model_name = "unknown"  # Will be resolved later if possible
+                self.sessions[session_id] = target_session
+                logging.info(f"Created minimal session {session_id} for GIN request from PID {pid}")
+            
+            if target_session:
+                target_session.gin_requests.append(request_data)
+                self._export_request_metrics(target_session, request_data)
+            else:
+                logging.warning(f"Could not find or create session for GIN request: {line.strip()}")
+    
+    def _export_session_metrics(self, session):
+        """Export session-related metrics to Prometheus"""
+        model_name = session.get_model_name()
+        session_id = session.session_id
+        pid = session.pid or "unknown"
+        
+        logging.info(f"Exporting metrics for session {session_id}: {model_name}")
+        
+        # Session info
+        OLLAMA_SESSION_ACTIVE.labels(
+            model=model_name,
+            session_id=session_id,
+            pid=pid
+        ).set(1)
+        
+        # Parse start time to timestamp
+        try:
+            if session.start_time:
+                # Handle different timestamp formats
+                start_ts = self._parse_timestamp(session.start_time)
+                OLLAMA_SESSION_START_TIME.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid
+                ).set(start_ts)
+        except Exception as e:
+            logging.warning(f"Could not parse start time {session.start_time}: {e}")
+        
+        # Runner start time
+        if session.runner_start_time:
+            try:
+                runner_time = float(session.runner_start_time.replace(' s', ''))
+                OLLAMA_SESSION_RUNNER_START_TIME.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid
+                ).set(runner_time)
+            except:
+                pass
+        
+        # Configuration metrics
+        if session.ctx_size and session.ctx_size != 'N/A':
+            try:
+                OLLAMA_MODEL_CONTEXT_SIZE.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid
+                ).set(int(session.ctx_size))
+            except:
+                pass
+        
+        if session.batch_size and session.batch_size != 'N/A':
+            try:
+                OLLAMA_MODEL_BATCH_SIZE.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid
+                ).set(int(session.batch_size))
+            except:
+                pass
+        
+        if session.gpu_layers and session.gpu_layers != 'N/A':
+            try:
+                OLLAMA_MODEL_GPU_LAYERS.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid
+                ).set(int(session.gpu_layers))
+            except:
+                pass
+        
+        if session.threads and session.threads != 'N/A':
+            try:
+                OLLAMA_MODEL_THREADS.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid
+                ).set(int(session.threads))
+            except:
+                pass
+        
+        if session.parallel and session.parallel != 'N/A':
+            try:
+                OLLAMA_MODEL_PARALLEL.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid
+                ).set(int(session.parallel))
+            except:
+                pass
+        
+        # VRAM metrics
+        gpu = session.gpu or "unknown"
+        if session.vram_available:
+            try:
+                vram_bytes = self._parse_memory_size(session.vram_available)
+                OLLAMA_MODEL_VRAM_AVAILABLE_BYTES.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid,
+                    gpu=gpu
+                ).set(vram_bytes)
+            except:
+                pass
+        
+        if session.vram_required:
+            try:
+                vram_bytes = self._parse_memory_size(session.vram_required)
+                OLLAMA_MODEL_VRAM_REQUIRED_BYTES.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid,
+                    gpu=gpu
+                ).set(vram_bytes)
+            except:
+                pass
+        
+        # Offload metrics
+        if session.offload_info:
+            offload = session.offload_info
+            
+            if 'layers.model' in offload:
+                try:
+                    OLLAMA_MODEL_LAYERS_TOTAL.labels(
+                        model=model_name,
+                        session_id=session_id,
+                        pid=pid
+                    ).set(int(offload['layers.model']))
+                except:
+                    pass
+            
+            if 'layers.offload' in offload:
+                try:
+                    OLLAMA_MODEL_LAYERS_OFFLOADED.labels(
+                        model=model_name,
+                        session_id=session_id,
+                        pid=pid
+                    ).set(int(offload['layers.offload']))
+                except:
+                    pass
+            
+            if 'memory.required.full' in offload:
+                try:
+                    mem_bytes = self._parse_memory_size(offload['memory.required.full'])
+                    OLLAMA_MODEL_MEMORY_REQUIRED_FULL_BYTES.labels(
+                        model=model_name,
+                        session_id=session_id,
+                        pid=pid
+                    ).set(mem_bytes)
+                except:
+                    pass
+            
+            if 'memory.required.kv' in offload:
+                try:
+                    mem_bytes = self._parse_memory_size(offload['memory.required.kv'])
+                    OLLAMA_MODEL_MEMORY_REQUIRED_KV_BYTES.labels(
+                        model=model_name,
+                        session_id=session_id,
+                        pid=pid
+                    ).set(mem_bytes)
+                except:
+                    pass
+    
+    def _export_request_metrics(self, session, request_data):
+        """Export request-related metrics to Prometheus"""
+        model_name = session.get_model_name()
+        session_id = session.session_id
+        
+        # Increment request counter
+        OLLAMA_REQUESTS_TOTAL.labels(
+            model=model_name,
+            endpoint=request_data['path'],
+            method=request_data['method'],
+            status=request_data['status'],
+            session_id=session_id
+        ).inc()
+        
+        # Record latency
+        try:
+            latency_sec = self.parse_duration(request_data['latency'])
+            OLLAMA_REQUEST_LATENCY.labels(
+                model=model_name,
+                endpoint=request_data['path'],
+                method=request_data['method'],
+                session_id=session_id
+            ).observe(latency_sec)
+        except:
+            pass
+    
+    def _parse_timestamp(self, timestamp_str):
+        """Parse timestamp string to Unix timestamp"""
+        # Handle different formats
+        formats = [
+            '%Y-%m-%dT%H:%M:%S%z',
+            '%Y-%m-%d %H:%M:%S',
+            '%m-%d %H:%M:%S'
+        ]
+        
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(timestamp_str, fmt)
+                return dt.timestamp()
+            except:
+                continue
+        
+        # Fallback to current time
+        return time.time()
+    
+    def _parse_memory_size(self, size_str):
+        """Parse memory size string to bytes"""
+        if not size_str:
+            return 0
+        
+        # Remove brackets and quotes
+        size_str = size_str.strip('[]"')
+        
+        # Extract number and unit
+        match = re.match(r'([\d\.]+)\s*([GMK]i?B?)', size_str, re.IGNORECASE)
+        if not match:
+            return 0
+        
+        value = float(match.group(1))
+        unit = match.group(2).upper()
+        
+        multipliers = {
+            'B': 1,
+            'KB': 1024, 'KIB': 1024,
+            'MB': 1024**2, 'MIB': 1024**2,
+            'GB': 1024**3, 'GIB': 1024**3
+        }
+        
+        return int(value * multipliers.get(unit, 1))
 
-def parse_duration(duration_str):
-    """Converts a duration string (e.g., 5.3s, 10ms) to seconds."""
-    val = float(re.findall(r'[\d\.]+', duration_str)[0])
-    if 'µs' in duration_str:
-        return val / 1_000_000
-    if 'ms' in duration_str:
-        return val / 1_000
-    if 'm' in duration_str:
-        return val * 60
-    if 'h' in duration_str:
-        return val * 3600
-    return val # Assumes seconds if no unit
 
 def build_model_map_from_manifests(models_base_path):
-    """Builds a map from blob digest to model name by scanning manifest files."""
+    """Build SHA256 -> model_name mapping from manifest files"""
     global model_map
     temp_model_map = {}
-
-    # Construct the full path to the manifests directory
+    
     manifests_path = os.path.join(os.path.expanduser(models_base_path), "manifests", "registry.ollama.ai", "library")
     logging.info(f"Building model map from manifests in {manifests_path}...")
+    
     try:
         if not os.path.isdir(manifests_path):
-            logging.warning(f"Manifests directory not found: {manifests_path}. Skipping map build.")
+            logging.warning(f"Manifests directory not found: {manifests_path}")
             return
-
+        
         for model_name in os.listdir(manifests_path):
             model_dir = os.path.join(manifests_path, model_name)
             if os.path.isdir(model_dir):
@@ -216,398 +769,669 @@ def build_model_map_from_manifests(models_base_path):
                                     full_model_name = f"{model_name}:{tag}"
                                     temp_model_map[blob_digest] = full_model_name
                                     logging.info(f"  Mapped blob {blob_digest[:12]}... to {full_model_name}")
-                                break # Assume one model layer per manifest
+                                break
                     except json.JSONDecodeError:
                         logging.warning(f"Could not decode JSON from manifest: {manifest_file}")
                     except Exception as e:
                         logging.error(f"Error processing manifest {manifest_file}: {e}")
     except Exception as e:
-        logging.error(f"An unexpected error occurred while scanning manifests: {e}")
-
+        logging.error(f"Error scanning manifests: {e}")
+    
     if not temp_model_map:
-        logging.warning("No models found in manifests. The map is empty.")
+        logging.warning("No models found in manifests")
     
     model_map = temp_model_map
 
-def parse_llama_server_line(line):
-    """Extracts model details from a 'starting llama server' or related log line."""
-    """Extract model and launch parameters from a 'starting llama server' log line.
 
-    Expected example:
-        msg="starting llama server" cmd="/usr/local/bin/ollama runner --model /root/.ollama/models/blobs/sha256-<digest> --ctx-size 8192 --batch-size 512 --n-gpu-layers 33 ..."
-    """
-    details: Dict[str, Any] = {}
-
-    # 1) Try to extract sha256 digest from the --model path
-    digest_match = re.search(r'sha256-([0-9a-f]{64})', line)
-    if digest_match:
-        digest = digest_match.group(1)
-        # Map digest to human-readable model name (if present)
-        model_name = model_map.get(digest)
-        if model_name:
-            details['model_name'] = model_name
-        details['model_digest'] = digest
-
-    # 2) Tokenise the command part to get flag values
-    cmd_match = re.search(r'cmd="([^"]+)"', line)
-    if cmd_match:
-        cmd_string = cmd_match.group(1)
-        try:
-            tokens = shlex.split(cmd_string)
-            # Iterate tokens to capture flag values
-            it = iter(tokens)
-            for tok in it:
-                if tok == '--ctx-size':
-                    details['n_ctx'] = int(next(it, '0'))
-                elif tok == '--batch-size':
-                    details['batch_size'] = int(next(it, '0'))
-                elif tok == '--n-gpu-layers':
-                    details['gpu_layers'] = f"{next(it, '0')}/33"  # total layers unknown; store offloaded count only
-                elif tok == '--threads':
-                    details['threads'] = int(next(it, '0'))
-                elif tok == '--parallel':
-                    details['parallel'] = int(next(it, '0'))
-        except Exception as e:
-            logging.debug(f"Failed to parse flags from cmd: {e}")
-
-    return details
-
-
-def parse_cmd_args(cmd_string):
-    """Parse command line arguments from the log string."""
-    args = shlex.split(cmd_string)
-    params = {}
+def find_models_path_from_journal():
+    """Scan journal logs for OLLAMA_MODELS env var to find models path"""
     try:
-        # Find the 'runner' subcommand to start parsing from there
-        runner_index = args.index('runner')
-        args_to_parse = args[runner_index + 1:]
-        i = 0
-        while i < len(args_to_parse):
-            if args_to_parse[i].startswith('--'):
-                key = args_to_parse[i][2:]
-                # Check if the next argument is a value or another flag
-                if i + 1 < len(args_to_parse) and not args_to_parse[i+1].startswith('--'):
-                    params[key] = args_to_parse[i+1]
-                    i += 2
-                else:
-                    # It's a boolean flag
-                    params[key] = True
-                    i += 1
-            else:
-                i += 1
-    except (ValueError, IndexError):
-        logging.warning(f"Could not parse cmd args from: {cmd_string}")
-    return params
-
-def parse_inference_compute_line(line):
-    """Parses the 'inference compute' log line to get detailed GPU info."""
-    details = {}
-    try:
-        parts = shlex.split(line)
-        for part in parts:
-            if '=' in part:
-                key, value = part.split('=', 1)
-                # Clean up keys and values
-                key = key.strip()
-                value = value.strip('"')
-                if key == 'total' or key == 'available':
-                    # Convert GiB/MiB to bytes
-                    size_bytes = 0
-                    if 'GiB' in value:
-                        size_bytes = float(value.replace('GiB', '').strip()) * (1024**3)
-                    elif 'MiB' in value:
-                        size_bytes = float(value.replace('MiB', '').strip()) * (1024**2)
-                    details[f'{key}_vram'] = size_bytes
-                else:
-                    details[key] = value
-    except Exception as e:
-        logging.warning(f"Could not parse inference compute line: '{line}'. Error: {e}")
-    return details
-
-def parse_kv_cache_line(line):
-    """Parses a log line to extract KV cache size.""" 
-    args = shlex.split(line)
-    params = {}
-    try:
-        # Find the 'runner' subcommand to start parsing from there
-        runner_index = args.index('runner')
-        args_to_parse = args[runner_index + 1:]
-        i = 0
-        while i < len(args_to_parse):
-            if args_to_parse[i].startswith('--'):
-                key = args_to_parse[i][2:]
-                # Check if the next argument is a value or another flag
-                if i + 1 < len(args_to_parse) and not args_to_parse[i+1].startswith('--'):
-                    params[key] = args_to_parse[i+1]
-                    i += 2
-                else:
-                    # It's a boolean flag
-                    params[key] = True
-                    i += 1
-            else:
-                i += 1
-    except (ValueError, IndexError):
-        logging.warning(f"Could not parse cmd args from: {line}")
-    return params
-
-def find_model_details_in_logs(pid):
-    """When a new PID is found, search recent logs to find its model name and parameters."""
-    details = {}
-    try:
-        # This command filters the entire journal for a specific PID to find the
-        # "starting llama server" log entry, which contains model details.
-        cmd = f"journalctl -u ollama.service --no-pager -o cat _PID={pid}"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
-        log_lines = result.stdout.strip().split('\n')
-
-        if not log_lines:
-            return None
-
-        for line in log_lines:
-            if 'starting llama server' in line:
-                # This is the primary log entry for model details
-                details = parse_llama_server_line(line)
-            elif 'inference compute' in line:
-                # This log entry contains detailed GPU information
-                gpu_details = parse_inference_compute_line(line)
-                if gpu_details:
-                    # Set GPU info metrics, they are static and only need to be set once
-                    gpu_id = gpu_details.get('id')
-                    if gpu_id and gpu_id not in processed_gpus:
-                        OLLAMA_GPU_INFO.labels(
-                            gpu_id=gpu_id,
-                            gpu_name=gpu_details.get('name'),
-                            gpu_library=gpu_details.get('library'),
-                            gpu_variant=gpu_details.get('variant'),
-                            gpu_compute=gpu_details.get('compute'),
-                            gpu_driver=gpu_details.get('driver')
-                        ).set(1)
-                        OLLAMA_GPU_VRAM_TOTAL_BYTES.labels(
-                            gpu_id=gpu_id, gpu_name=gpu_details.get('name')
-                        ).set(gpu_details.get('total_vram', 0))
-                        OLLAMA_GPU_VRAM_AVAILABLE_BYTES.labels(
-                            gpu_id=gpu_id, gpu_name=gpu_details.get('name')
-                        ).set(gpu_details.get('available_vram', 0))
-                        processed_gpus.add(gpu_id)
-
-        if 'model_name' in details:
-            logging.info(f"Discovered details for model '{details['model_name']}' (PID: {pid}): {details}")
-            return details
-
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        logging.warning(f"Could not search journal for PID {pid}.")
-    except Exception as e:
-        logging.error(f"An unexpected error occurred in find_model_details_in_logs: {e}")
-
-    return None
-
-def follow_ollama_logs():
-    """Follows the journalctl log, manages state, and updates metrics."""
-    global pid_model_cache
-    
-    gin_log_re = re.compile(r'ollama\[(\d+)\].*?(POST|GET).*?("/api/chat"|"/api/generate")')
-    start_server_re = re.compile(r'ollama\[(\d+)\].*msg="starting llama server"')
-
-    try:
-        process = subprocess.Popen(shlex.split(f"sudo {LOG_COMMAND}"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
+        logging.info("Scanning journal logs for OLLAMA_MODELS path...")
+        env = os.environ.copy()
+        env['LANG'] = 'C.UTF-8'
+        env['LC_ALL'] = 'C.UTF-8'
+        
+        process = subprocess.Popen(
+            ['journalctl', '-u', JOURNALCTL_UNIT, '--no-pager', '--output=cat', '-r'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, 
+            encoding='utf-8', errors='replace', env=env
+        )
+        
+        models_path_re = re.compile(r'OLLAMA_MODELS:(\S+)')
+        
         for line in iter(process.stdout.readline, ''):
-
             if not line:
                 break
-
-            # Case 1: A request is being processed
-            gin_match = gin_log_re.search(line)
-            if gin_match:
-                pid, method, endpoint = gin_match.groups()
-                model_details = pid_model_cache.get(str(pid))
-
-                # If not in cache, this is the first time we see this PID. Find its details.
-                if not model_details:
-                    model_details = find_model_details_in_logs(pid)
-                    if model_details:
-                        # Cache the details
-                        pid_model_cache[str(pid)] = model_details
-                        # Set the one-time informational metrics
-                        OLLAMA_MODEL_INFO.labels(
-                            model=model_details.get('model_name', 'unknown'),
-                            pid=str(pid),
-                            quantization=model_details.get('quantization', 'unknown'),
-                            params_billion=model_details.get('params_billion', 0),
-                            n_ctx=model_details.get('n_ctx', 0),
-                            gpu_layers=model_details.get('gpu_layers', '0/0')
-                        ).set(1)
-                        OLLAMA_MODEL_VRAM_BUFFER_BYTES.labels(
-                            model=model_details.get('model_name', 'unknown'),
-                            pid=str(pid)
-                        ).set(model_details.get('vram_buffer_bytes', 0))
-                        OLLAMA_MODEL_VRAM_KV_CACHE_BYTES.labels(
-                            model=model_details.get('model_name', 'unknown'),
-                            pid=str(pid)
-                        ).set(model_details.get('vram_kv_cache_bytes', 0))
-
-                if model_details:
-                    model_name = model_details.get('model_name', 'unknown')
-                    # Now, update the request-specific metrics
-                    OLLAMA_REQUESTS_TOTAL.labels(endpoint=endpoint.strip('"'), model=model_name, session_id=str(pid)).inc()
-                    latency_match = re.search(r'\|\s+([\d\.]+\w*s)\s+\|', line)
-                    if latency_match:
-                        latency_sec = parse_duration(latency_match.group(1))
-                        OLLAMA_REQUEST_LATENCY.labels(method=method, path=endpoint.strip('"'), model=model_name, session_id=str(pid)).observe(latency_sec)
-                else:
-                    # This can happen if the reverse search fails or if the log appears before the start event
-                    logging.warning(f"Request for PID {pid} appeared, but could not determine model.")
-                continue
-
-            # Case 2: A new model is being loaded (for cache invalidation)
-            start_match = start_server_re.search(line)
-            if start_match:
-                pid = start_match.group(1)
-                # Always use string for cache lookups
-                if str(pid) in pid_model_cache:
-                    logging.info(f"New model started for PID {pid}. Invalidating cache.")
-                    del pid_model_cache[str(pid)]
-
-    except FileNotFoundError:
-        logging.error(f"Command '{LOG_COMMAND}' not found. Please ensure 'journalctl' is in the system's PATH.")
-    except Exception as e:
-        logging.error(f"An error occurred while following logs: {e}")
-
-
-def background_scheduler(interval, task_func, *args, **kwargs):
-    """Runs a task function periodically in a loop."""
-    while True:
-        try:
-            task_func(*args, **kwargs)
-        except Exception as e:
-            logging.error(f"Error in background task {task_func.__name__}: {e}")
-        time.sleep(interval)
-
-def update_resource_metrics():
-    """Periodically updates resource usage metrics for active models and GPUs."""
-    while True:
-        try:
-            # Create a copy of the dictionary to avoid runtime errors during iteration
-            pids_to_check = pid_model_cache.copy()
             
-            active_pids = []
+            if 'OLLAMA_MODELS:' in line:
+                m = models_path_re.search(line)
+                if m:
+                    models_path = m.group(1).strip(']"')
+                    logging.info(f"Found Ollama models path: {models_path}")
+                    process.terminate()
+                    return models_path
+        
+        process.wait()
+        logging.warning("Could not find OLLAMA_MODELS path in journal")
+        return None
+        
+    except FileNotFoundError:
+        logging.error("journalctl command not found")
+        return None
+    except Exception as e:
+        logging.error(f"Error searching for models path: {e}")
+        return None
 
-            for pid, model_details in pids_to_check.items():
-                model_name = model_details.get('model_name', 'unknown')
 
-                # psutil requires integer PID
-                if psutil.pid_exists(int(pid)):
-                    active_pids.append(pid)
-                    try:
-                        p = psutil.Process(int(pid))
-                        OLLAMA_MODEL_ACTIVE.labels(model=model_name, pid=pid).set(1)
-                        OLLAMA_MODEL_RAM_USAGE_BYTES.labels(model=model_name, pid=pid).set(p.memory_info().rss)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        # Process might have just died, handled in the next block
-                        pass
-                else:
-                    # Process is gone, clean up all associated metrics
-                    logging.info(f"Process {pid} for model '{model_name}' is no longer active. Cleaning up metrics.")
-                    # Use a try-except block for each metric removal to avoid crashes if a label combination was never created
-                    try: OLLAMA_MODEL_ACTIVE.remove(model_name, pid) 
-                    except KeyError: pass
-                    try: OLLAMA_MODEL_RAM_USAGE_BYTES.remove(model_name, pid) 
-                    except KeyError: pass
-                    try: 
-                        OLLAMA_MODEL_INFO.remove(
-                            model_name,
-                            pid,
-                            model_details.get('quantization', 'unknown'),
-                            model_details.get('params_billion', 0),
-                            model_details.get('n_ctx', 0),
-                            model_details.get('gpu_layers', '0/0')
-                        )
-                    except KeyError: pass
-                    try: OLLAMA_MODEL_VRAM_BUFFER_BYTES.remove(model_name, pid) 
-                    except KeyError: pass
-                    try: OLLAMA_MODEL_VRAM_KV_CACHE_BYTES.remove(model_name, pid) 
-                    except KeyError: pass
-                    
-                    # Remove from cache
-                    if str(pid) in pid_model_cache:
-                        del pid_model_cache[str(pid)]
-
-        except Exception as e:
-            logging.error(f"Error in resource metrics thread: {e}")
-
-        # --- GPU Metrics Collection ---
-        try:
-            smi_output = subprocess.check_output(['nvidia-smi', '-q', '-x'], text=True)
-            root = ET.fromstring(smi_output)
-
-            for gpu in root.findall('gpu'):
-                gpu_uuid = gpu.find('uuid').text
-                utilization = gpu.find('utilization')
-                gpu_util = float(utilization.find('gpu_util').text.replace(' %', ''))
+def collect_system_info():
+    """Collect Ollama system information from startup logs (first approach)"""
+    global system_info_collected
+    
+    if system_info_collected:
+        return
+    
+    try:
+        logging.info("Collecting Ollama system information from startup logs...")
+        
+        # Get startup context (like parser does)
+        cmd = "journalctl -u ollama.service --no-pager"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
+        log_lines = result.stdout.splitlines()
+        
+        # Find last startup context
+        last_start_idx = -1
+        for i, line in reversed(list(enumerate(log_lines))):
+            if "Started ollama.service" in line or "Starting Ollama Service" in line:
+                last_start_idx = i
+                break
+        
+        if last_start_idx == -1:
+            logging.warning("No Ollama service startup found in logs")
+            return
+        
+        # Process startup context (10 lines before and after startup)
+        start_slice = max(0, last_start_idx - 10)
+        end_slice = min(len(log_lines), last_start_idx + 50)  # More lines after to catch GPU info
+        context_lines = log_lines[start_slice:end_slice]
+        
+        # Parse system events and Ollama events
+        systemd_events = []
+        ollama_events = []
+        
+        for line in context_lines:
+            parts = line.strip().split()
+            if not parts or len(parts) < 4:
+                continue
                 
-                memory = gpu.find('fb_memory_usage')
-                total_mem = float(memory.find('total').text.replace(' MiB', ''))
-                used_mem = float(memory.find('used').text.replace(' MiB', ''))
-                mem_util = (used_mem / total_mem * 100) if total_mem > 0 else 0
+            timestamp_str = " ".join(parts[:3])
+            message = " ".join(parts[3:])
+            
+            # SYSTEMD EVENTS
+            if "systemd" in message:
+                if "Started ollama.service" in message:
+                    # Parse timestamp and set service start time
+                    try:
+                        start_ts = parse_systemd_timestamp(timestamp_str)
+                        OLLAMA_SERVICE_START_TIME.set(start_ts)
+                        logging.info(f"Set Ollama service start time: {timestamp_str}")
+                    except Exception as e:
+                        logging.warning(f"Could not parse service start time: {e}")
+                        
+                elif "Scheduled restart job" in message:
+                    OLLAMA_SERVICE_RESTARTS_TOTAL.inc()
+                    logging.info("Incremented service restart counter")
+            
+            # OLLAMA EVENTS
+            elif "ollama[" in message:
+                # API Ready - extract version and port
+                if "Listening on" in message:
+                    port = None
+                    version = None
+                    
+                    m = re.search(r'Listening on [^ ]*:(\d+).*(version ([\w.]+))', message)
+                    if m:
+                        port = m.group(1)
+                        version = m.group(3)
+                    else:
+                        m2 = re.search(r'Listening on [^ ]*:(\d+)', message)
+                        if m2:
+                            port = m2.group(1)
+                    
+                    # Set system info
+                    OLLAMA_SYSTEM_INFO.labels(
+                        service_status="running",
+                        version=version or "unknown",
+                        port=port or "unknown"
+                    ).info({
+                        'startup_time': timestamp_str,
+                        'status': 'active'
+                    })
+                    
+                    logging.info(f"Set Ollama system info - Version: {version}, Port: {port}")
+                
+                # GPU Found - extract detailed GPU information
+                elif 'msg="inference compute"' in message:
+                    gpu_details = {}
+                    
+                    # Parse all key=value pairs from the inference compute message
+                    for key, val in re.findall(r'(\w+(?:\.\w+)*|projector\.\w+)=((?:"[^"]*")|(?:\[[^\]]*\])|(?:[^\s]+))', message):
+                        gpu_details[key] = val.strip('"')
+                    
+                    if gpu_details:
+                        gpu_id = gpu_details.get('id', 'unknown')
+                        gpu_name = gpu_details.get('name', 'unknown')
+                        
+                        # Set GPU info
+                        OLLAMA_GPU_INFO.labels(
+                            gpu_id=gpu_id,
+                            gpu_name=gpu_name,
+                            library=gpu_details.get('library', 'unknown'),
+                            variant=gpu_details.get('variant', 'unknown'),
+                            compute=gpu_details.get('compute', 'unknown'),
+                            driver=gpu_details.get('driver', 'unknown')
+                        ).info({
+                            'detection_time': timestamp_str,
+                            'all_details': str(gpu_details)
+                        })
+                        
+                        # Set VRAM metrics if available
+                        if 'total' in gpu_details:
+                            try:
+                                total_vram = parse_vram_size(gpu_details['total'])
+                                OLLAMA_GPU_VRAM_TOTAL_BYTES.labels(
+                                    gpu_id=gpu_id,
+                                    gpu_name=gpu_name
+                                ).set(total_vram)
+                                logging.info(f"Set GPU total VRAM: {gpu_details['total']} ({total_vram} bytes)")
+                            except Exception as e:
+                                logging.warning(f"Could not parse total VRAM: {e}")
+                        
+                        if 'available' in gpu_details:
+                            try:
+                                available_vram = parse_vram_size(gpu_details['available'])
+                                OLLAMA_GPU_VRAM_AVAILABLE_BYTES.labels(
+                                    gpu_id=gpu_id,
+                                    gpu_name=gpu_name
+                                ).set(available_vram)
+                                logging.info(f"Set GPU available VRAM: {gpu_details['available']} ({available_vram} bytes)")
+                            except Exception as e:
+                                logging.warning(f"Could not parse available VRAM: {e}")
+                        
+                        logging.info(f"Set GPU info - ID: {gpu_id}, Name: {gpu_name}, Library: {gpu_details.get('library')}")
+        
+        system_info_collected = True
+        logging.info("System information collection completed")
+        
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Could not read journal for system info: {e}")
+    except Exception as e:
+        logging.error(f"Error collecting system info: {e}")
 
-                OLLAMA_GPU_UTILIZATION_PERCENT.labels(gpu_uuid=gpu_uuid).set(gpu_util)
-                OLLAMA_GPU_MEMORY_USAGE_PERCENT.labels(gpu_uuid=gpu_uuid).set(mem_util)
 
-                # Find processes running on this GPU
-                for proc in gpu.find('processes').findall('process_info'):
-                    pid_str = proc.find('pid').text
-                    if pid_str in pid_model_cache:
-                        model_details = pid_model_cache.get(pid_str, {})
-                        model_name = model_details.get('model_name', 'unknown')
-                        used_gpu_memory_mib = float(proc.find('used_memory').text.replace(' MiB', ''))
-                        OLLAMA_MODEL_GPU_USAGE_BYTES.labels(model=model_name, pid=pid_str, gpu_uuid=gpu_uuid).set(used_gpu_memory_mib * 1024 * 1024)
+def parse_systemd_timestamp(timestamp_str):
+    """Parse systemd timestamp to Unix timestamp"""
+    # Handle different systemd timestamp formats
+    formats = [
+        '%b %d %H:%M:%S',  # Jul 16 12:06:26
+        '%Y-%m-%d %H:%M:%S',
+        '%m-%d %H:%M:%S'
+    ]
+    
+    for fmt in formats:
+        try:
+            # For formats without year, assume current year
+            if '%Y' not in fmt:
+                current_year = datetime.now().year
+                dt = datetime.strptime(f"{current_year} {timestamp_str}", f"%Y {fmt}")
+            else:
+                dt = datetime.strptime(timestamp_str, fmt)
+            return dt.timestamp()
+        except:
+            continue
+    
+    # Fallback to current time
+    return time.time()
 
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            # This will fail gracefully if nvidia-smi is not installed or fails
-            pass 
+
+def parse_vram_size(vram_str):
+    """Parse VRAM size string like '11.8 GiB' to bytes"""
+    if not vram_str:
+        return 0
+    
+    # Extract number and unit
+    match = re.match(r'([\d\.]+)\s*([GMK]i?B?)', vram_str, re.IGNORECASE)
+    if not match:
+        return 0
+    
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+    
+    multipliers = {
+        'B': 1,
+        'KB': 1024, 'KIB': 1024,
+        'MB': 1024**2, 'MIB': 1024**2,
+        'GB': 1024**3, 'GIB': 1024**3
+    }
+    
+    return int(value * multipliers.get(unit, 1))
+
+
+def load_recent_sessions(session_tracker, hours_back=2):
+    """Load recent sessions for each PID (second approach like parser)"""
+    try:
+        logging.info(f"Loading recent sessions from last {hours_back} hours...")
+        
+        # Get recent logs (like parser does with dump_recent_logs_to_file)
+        cmd = f"journalctl -u ollama.service --since '{hours_back} hours ago' --no-pager -o short-iso"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
+        
+        lines = result.stdout.strip().split('\n')
+        logging.info(f"Processing {len(lines)} recent log lines for session detection...")
+        
+        # Track active PIDs and their sessions
+        active_pids = set()
+        pid_sessions = {}  # PID -> latest session data
+        
+        # First pass: identify all active PIDs and their latest sessions
+        for line in lines:
+            if not line.strip() or 'ollama[' not in line:
+                continue
+                
+            # Extract PID
+            m_pid = re.search(r'ollama\[(\d+)\]', line)
+            if not m_pid:
+                continue
+                
+            pid = m_pid.group(1)
+            active_pids.add(pid)
+            
+            # Look for session start events
+            if ('msg="starting llama server"' in line or 
+                'msg="new model will fit in available VRAM in single GPU, loading"' in line):
+                
+                timestamp = line.split()[0] if line.split() else str(datetime.now())
+                
+                # Initialize or update session for this PID
+                if pid not in pid_sessions:
+                    pid_sessions[pid] = {
+                        'pid': pid,
+                        'start_time': timestamp,
+                        'lines': [],
+                        'last_activity': timestamp
+                    }
+                else:
+                    # Update with newer session start
+                    pid_sessions[pid]['start_time'] = timestamp
+                    pid_sessions[pid]['last_activity'] = timestamp
+        
+        logging.info(f"Found {len(active_pids)} active PIDs: {list(active_pids)}")
+        
+        # Second pass: collect session data for each PID
+        for pid in active_pids:
+            if pid not in pid_sessions:
+                continue
+                
+            logging.info(f"Processing session data for PID {pid}...")
+            
+            # Collect all lines for this PID
+            pid_lines = []
+            for line in lines:
+                if f'ollama[{pid}]' in line:
+                    pid_lines.append(line)
+            
+            if not pid_lines:
+                continue
+            
+            # Process lines to build session (like parser does)
+            session_data = _build_session_from_lines(pid, pid_lines, session_tracker)
+            
+            if session_data:
+                # Create session in tracker
+                session_id = f"session_recent_{pid}"
+                session = OllamaSession(session_id, session_data['start_time'], pid)
+                
+                # Copy all extracted data
+                for key, value in session_data.items():
+                    if hasattr(session, key):
+                        setattr(session, key, value)
+                
+                # Add to tracker
+                session_tracker.sessions[session_id] = session
+                
+                # Export metrics for this session
+                session_tracker._export_session_metrics(session)
+                
+                logging.info(f"Created session {session_id} for PID {pid}: {session.get_model_name()}")
+        
+        logging.info(f"Recent session loading complete. Total sessions: {len(session_tracker.sessions)}")
+        
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Could not read recent logs: {e}")
+    except Exception as e:
+        logging.error(f"Error loading recent sessions: {e}")
+
+
+def _build_session_from_lines(pid, lines, session_tracker):
+    """Build session data from lines for a specific PID (like parser logic)"""
+    session_data = {
+        'pid': pid,
+        'start_time': None,
+        'model_name': None,
+        'sha256': None,
+        'model_sha256': None,
+        'architecture': None,
+        'size_label': None,
+        'params_label': None,
+        'file_size_label': None,
+        'ctx_size': None,
+        'batch_size': None,
+        'gpu_layers': None,
+        'threads': None,
+        'parallel': None,
+        'port': None,
+        'gpu': None,
+        'vram_available': None,
+        'vram_required': None,
+        'model_path': None,
+        'offload_info': {},
+        'runner_start_time': None,
+        'gin_requests': []
+    }
+    
+    runner_block_active = False
+    metadata_block_active = False
+    runner_block_lines = 0
+    
+    for i, line in enumerate(lines):
+        # Extract timestamp for start_time
+        if not session_data['start_time']:
+            session_data['start_time'] = line.split()[0] if line.split() else str(datetime.now())
+        
+        # Check for session start events
+        if ('msg="starting llama server"' in line or 
+            'msg="new model will fit in available VRAM in single GPU, loading"' in line):
+            
+            session_data['start_time'] = line.split()[0] if line.split() else str(datetime.now())
+            
+            if 'msg="starting llama server"' in line:
+                runner_block_active = True
+                runner_block_lines = 20
+                metadata_block_active = True
+        
+        # Process runner block (20 lines after starting llama server)
+        if runner_block_active and runner_block_lines > 0:
+            
+            # Extract metadata while block is active
+            if metadata_block_active:
+                if 'general.name' in line:
+                    m = re.search(r'general\.name\s+str\s*=\s*(.+)', line)
+                    if m and not session_data['model_name']:
+                        session_data['model_name'] = m.group(1).strip()
+                
+                elif 'general.size_label' in line:
+                    m = re.search(r'general\.size_label\s+str\s*=\s*(.+)', line)
+                    if m and not session_data['size_label']:
+                        session_data['size_label'] = m.group(1).strip()
+                
+                elif 'general.architecture' in line:
+                    m = re.search(r'general\.architecture\s+str\s*=\s*(.+)', line)
+                    if m and not session_data['architecture']:
+                        session_data['architecture'] = m.group(1).strip()
+                
+                elif 'print_info: model params' in line:
+                    m = re.search(r'print_info: model params\s*=\s*([\d\.]+\s*[BMKbmkg])', line)
+                    if m and not session_data['params_label']:
+                        session_data['params_label'] = m.group(1).strip()
+                
+                elif 'print_info: file size' in line:
+                    m = re.search(r'print_info: file size\s*=\s*([\d\.]+\s*[GMK]i?B)', line)
+                    if not m:
+                        m = re.search(r'print_info: file size\s*=\s*([^\(]+)', line)
+                    if m and not session_data['file_size_label']:
+                        session_data['file_size_label'] = m.group(1).strip().split('(')[0].strip()
+                
+                # End metadata block if no relevant content
+                elif not any(x in line for x in ['general.name', 'general.size_label', 'general.architecture', 'print_info: model params']):
+                    metadata_block_active = False
+            
+            # Process VRAM loading
+            if 'msg="new model will fit in available VRAM in single GPU, loading"' in line:
+                m_sha = re.search(r'sha256-([a-f0-9]{64})', line)
+                if m_sha:
+                    session_data['model_sha256'] = m_sha.group(1)
+                    session_data['sha256'] = m_sha.group(1)
+                
+                m_gpu = re.search(r'gpu=([\w\-]+)', line)
+                if m_gpu:
+                    session_data['gpu'] = m_gpu.group(1)
+                
+                m_parallel = re.search(r'parallel=(\d+)', line)
+                if m_parallel:
+                    session_data['parallel'] = m_parallel.group(1)
+                
+                m_avail = re.search(r'available=([0-9]+)', line)
+                if m_avail:
+                    session_data['vram_available'] = m_avail.group(1)
+                
+                m_req = re.search(r'required="([^"]+)"', line)
+                if m_req:
+                    session_data['vram_required'] = m_req.group(1)
+                
+                m_model_path = re.search(r'model=([^\s]+)', line)
+                if m_model_path:
+                    session_data['model_path'] = m_model_path.group(1)
+            
+            # Process offload info
+            elif 'msg=offload' in line:
+                offload_str = line.split('msg=offload ')[1]
+                session_data['offload_info'] = session_tracker.parse_key_value_string(offload_str)
+            
+            # Process starting llama server
+            elif 'msg="starting llama server"' in line:
+                cmd_str = line.split('cmd=')[1].strip().strip('"')
+                cmd_parts = cmd_str.split()
+                params = {}
+                
+                for j, part in enumerate(cmd_parts):
+                    if part.startswith('--') and j + 1 < len(cmd_parts):
+                        params[part] = cmd_parts[j+1]
+                
+                model_path = params.get('--model', '')
+                sha = model_path.split('sha256-')[-1] if 'sha256-' in model_path else None
+                
+                session_data['sha256'] = sha
+                session_data['ctx_size'] = params.get('--ctx-size', 'N/A')
+                session_data['batch_size'] = params.get('--batch-size', 'N/A')
+                session_data['gpu_layers'] = params.get('--n-gpu-layers', 'N/A')
+                session_data['threads'] = params.get('--threads', 'N/A')
+                session_data['parallel'] = params.get('--parallel', 'N/A')
+                session_data['port'] = params.get('--port', 'N/A')
+            
+            # Process runner start time
+            elif 'msg="llama runner started' in line:
+                time_str = line.split(' in ')[-1].split(' seconds')[0]
+                session_data['runner_start_time'] = f"{time_str} s"
+            
+            runner_block_lines -= 1
+            
+            if runner_block_lines <= 0:
+                runner_block_active = False
+        
+        # Collect GIN requests for this session
+        if '[GIN]' in line:
+            gin_pattern = re.compile(r'^([\d\-:T\+]+)\s+[^:]+: \[GIN\]\s+(\d{4}/\d{2}/\d{2} - \d{2}:\d{2}:\d{2}) \| (\d+) \| ([^|]+) \|\s*([^|]+) \|\s*(\w+)\s+"([^"]+)"')
+            m = gin_pattern.search(line)
+            
+            if m:
+                request_data = {
+                    'journal_time': m.group(1).strip(),
+                    'status': m.group(3).strip(),
+                    'latency': m.group(4).strip(),
+                    'ip': m.group(5).strip(),
+                    'method': m.group(6).strip(),
+                    'path': m.group(7).strip(),
+                    'raw_line': line.strip()
+                }
+                session_data['gin_requests'].append(request_data)
+    
+    # Resolve model name using model_map
+    sha = session_data['sha256'] or session_data['model_sha256']
+    if sha and sha in model_map:
+        session_data['model_name'] = model_map[sha]
+    
+    # Return session data if it has meaningful content
+    if (session_data['sha256'] or session_data['model_sha256'] or 
+        session_data['model_name'] or session_data['offload_info']):
+        return session_data
+    
+    return None
+
+
+def follow_ollama_logs(session_tracker):
+    """Follow journalctl logs and process them with session tracker"""
+    try:
+        # First load recent sessions (second approach)
+        load_recent_sessions(session_tracker)
+        
+        logging.info(f"Starting to follow new logs with command: sudo {LOG_COMMAND}")
+        process = subprocess.Popen(
+            shlex.split(f"sudo {LOG_COMMAND}"), 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True
+        )
+        
+        for line in iter(process.stdout.readline, ''):
+            if not line:
+                break
+            
+            # Debug: log every line we receive
+            if 'ollama[' in line:
+                logging.info(f"Processing new log line: {line.strip()}")
+            
+            try:
+                session_tracker.process_line(line.strip())
+            except Exception as e:
+                logging.error(f"Error processing line: {e}")
+                logging.debug(f"Problematic line: {line.strip()}")
+        
+    except FileNotFoundError:
+        logging.error(f"Command not found: {LOG_COMMAND}")
+    except Exception as e:
+        logging.error(f"Error following logs: {e}")
+
+
+def background_model_map_updater(models_path):
+    """Background thread to periodically update model map"""
+    while True:
+        try:
+            build_model_map_from_manifests(models_path)
         except Exception as e:
-            logging.error(f"Error parsing nvidia-smi output: {e}")
+            logging.error(f"Error updating model map: {e}")
+        
+        time.sleep(MODEL_MAP_UPDATE_INTERVAL)
 
-        time.sleep(15) # Update interval
+
+def cleanup_inactive_sessions(session_tracker):
+    """Background thread to clean up metrics for inactive sessions"""
+    while True:
+        try:
+            current_time = time.time()
+            inactive_sessions = []
+            
+            for session_id, session in session_tracker.sessions.items():
+                # Check if session is still active (has recent requests or process exists)
+                if session.pid:
+                    try:
+                        # Check if process still exists
+                        os.kill(int(session.pid), 0)
+                        continue  # Process exists, session is active
+                    except (OSError, ValueError):
+                        # Process doesn't exist
+                        pass
+                
+                # Mark session as inactive
+                inactive_sessions.append(session_id)
+            
+            # Clean up inactive sessions
+            for session_id in inactive_sessions:
+                session = session_tracker.sessions[session_id]
+                model_name = session.get_model_name()
+                pid = session.pid or "unknown"
+                
+                logging.info(f"Cleaning up inactive session {session_id}: {model_name}")
+                
+                # Set session as inactive
+                OLLAMA_SESSION_ACTIVE.labels(
+                    model=model_name,
+                    session_id=session_id,
+                    pid=pid
+                ).set(0)
+                
+                # Remove from active sessions
+                del session_tracker.sessions[session_id]
+        
+        except Exception as e:
+            logging.error(f"Error in session cleanup: {e}")
+        
+        time.sleep(60)  # Check every minute
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Ollama Log Exporter for Prometheus (New Version)')
+    parser.add_argument('--port', type=int, default=9877, help='Port to expose Prometheus metrics')
+    args = parser.parse_args()
+    
+    logging.info("Starting Ollama Log Exporter (New Version)")
+    
+    # Find models path
+    models_path = find_models_path_from_journal()
+    if not models_path:
+        logging.critical("Failed to determine Ollama models path. Exporter cannot start.")
+        return 1
+    
+    logging.info(f"Using models path: {models_path}")
+    
+    # Initial model map build
+    build_model_map_from_manifests(models_path)
+    
+    # Collect system information (first approach)
+    collect_system_info()
+    
+    # Start Prometheus server
+    start_http_server(args.port)
+    logging.info(f"Prometheus exporter server started on port {args.port}")
+    
+    # Create session tracker
+    session_tracker = SessionTracker()
+    
+    # Start background threads
+    model_map_thread = threading.Thread(
+        target=background_model_map_updater,
+        args=(models_path,),
+        daemon=True
+    )
+    model_map_thread.start()
+    logging.info("Started background model map updater")
+    
+    cleanup_thread = threading.Thread(
+        target=cleanup_inactive_sessions,
+        args=(session_tracker,),
+        daemon=True
+    )
+    cleanup_thread.start()
+    logging.info("Started background session cleanup")
+    
+    # Main log following loop
+    try:
+        follow_ollama_logs(session_tracker)
+    except KeyboardInterrupt:
+        logging.info("Exporter stopped by user")
+        return 0
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
+        return 1
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Ollama Log Exporter for Prometheus.')
-    parser.add_argument('--port', type=int, default=9877, help='Port to expose Prometheus metrics on.')
-    args = parser.parse_args()
-
-    # logging configured earlier
-
-    # --- Determine Models Path ---
-    # The path is determined exclusively by scanning journald logs.
-    models_path = find_models_path_from_journal()
-    if not models_path:
-        logging.critical("Failed to automatically determine Ollama models path from journal. Exporter cannot start.")
-        exit(1)
-    logging.info(f"Using models path: {models_path}")
-
-    # Initial build of the model map
-    build_model_map_from_manifests(models_path)
-
-    # Start the Prometheus server in a separate thread
-    start_http_server(args.port)
-    logging.info(f"Prometheus exporter server started on port {args.port}")
-
-    # Start the background thread for updating resource metrics
-    resource_thread = threading.Thread(target=update_resource_metrics, daemon=True)
-    resource_thread.start()
-    logging.info("Started background thread for resource monitoring.")
-
-    # Start background task to update the model map
-    map_updater = threading.Thread(
-        target=background_scheduler, 
-        args=(MODEL_MAP_UPDATE_INTERVAL, build_model_map_from_manifests, models_path),
-        daemon=True
-    )
-    map_updater.start()
-
-    # The main thread will follow logs
-    try:
-        follow_ollama_logs()
-    except KeyboardInterrupt:
-        logging.info("Exporter stopped by user.")
+    exit(main())
