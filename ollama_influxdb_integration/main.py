@@ -28,11 +28,16 @@ class OllamaInfluxDBIntegration:
     def __init__(self, config_file: str = 'config.json'):
         """Инициализация интеграции."""
         self.config = self.load_config(config_file)
+        
+        # Путь к манифестам Ollama
+        self.manifests_root = Path(self.config.get('ollama', {}).get('manifests_path', '/root/.ollama/models/manifests'))
+        
         self.writer = OllamaInfluxDBWriter(
             influxdb_url=self.config['influxdb']['url'],
             token=self.config['influxdb']['token'],
             org=self.config['influxdb']['org'],
-            bucket=self.config['influxdb']['bucket']
+            bucket=self.config['influxdb']['bucket'],
+            manifests_path=str(self.manifests_root)
         )
         
         # Пути к файлам
@@ -40,9 +45,6 @@ class OllamaInfluxDBIntegration:
         self.reports_dir.mkdir(exist_ok=True)
         
         self.dump_file = self.reports_dir / 'ollama_log_dump.txt'
-        
-        # Путь к манифестам Ollama
-        self.manifests_root = Path(self.config.get('ollama', {}).get('manifests_path', '/root/.ollama/models/manifests'))
         
         # Отслеживание последнего времени парсинга
         self.last_parse_time = None

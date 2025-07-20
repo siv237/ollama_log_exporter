@@ -5,17 +5,61 @@ InfluxDB Writer для интеграции парсера логов Ollama с 
 """
 
 import json
+import re
+import os
 import time
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, List, Optional
+from pathlib import Path
 from dateutil import parser as dtparser
 import requests
+
+
+def build_sha_to_name_map_from_manifests(manifests_root):
+    """Строит карту sha256 → имя модели по всем манифестам Ollama (универсально, без хардкодов)."""
+    sha_to_name = {}
+    if not manifests_root or not os.path.exists(manifests_root):
+        return sha_to_name
+        
+    for root, dirs, files in os.walk(manifests_root):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            # Имя модели из пути: .../library/phi4/latest → phi4:latest
+            rel = os.path.relpath(fpath, manifests_root)
+            parts = rel.split(os.sep)
+            # ищем структуру .../repo/model/tag
+            if len(parts) >= 3:
+                model_name = f"{parts[-2]}:{parts[-1]}"
+            else:
+                model_name = parts[-1]
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                # digest sha256 слоя модели
+                for layer in data.get('layers', []):
+                    if layer.get('mediaType', '').endswith('model') and 'sha256:' in layer.get('digest', ''):
+                        sha = layer['digest'].split('sha256:')[-1]
+                        sha_to_name[sha] = model_name
+            except Exception:
+                continue
+    return sha_to_name
+
+
+def get_model_name(sha, session=None, sha_to_name_manifests=None):
+    """Возвращает имя модели по sha256: сначала ищет в manifests, потом в сессии."""
+    if not sha:
+        return "unknown"
+    if sha_to_name_manifests and sha in sha_to_name_manifests:
+        return sha_to_name_manifests[sha]
+    if session and session.get('model_name'):
+        return session['model_name']
+    return "unknown"
 
 
 class OllamaInfluxDBWriter:
     """Класс для записи данных Ollama в InfluxDB."""
     
-    def __init__(self, influxdb_url: str, token: str, org: str, bucket: str):
+    def __init__(self, influxdb_url: str, token: str, org: str, bucket: str, manifests_path: str = None):
         """
         Инициализация writer'а.
         
@@ -24,12 +68,16 @@ class OllamaInfluxDBWriter:
             token: API токен InfluxDB
             org: Организация InfluxDB
             bucket: Bucket для записи данных
+            manifests_path: Путь к манифестам Ollama для определения названий моделей
         """
         self.influxdb_url = influxdb_url.rstrip('/')
         self.token = token
         self.org = org
         self.bucket = bucket
         self.write_url = f"{self.influxdb_url}/api/v2/write"
+        
+        # Строим карту SHA256 → название модели из манифестов
+        self.sha_to_name_manifests = build_sha_to_name_map_from_manifests(manifests_path)
         
         # Headers для API запросов
         self.headers = {
@@ -191,18 +239,25 @@ class OllamaInfluxDBWriter:
         base_tags = {}
         
         # Модель и SHA256
-        model_name = session.get('model_name', 'unknown')
         sha256 = session.get('sha256', session.get('model_sha256', ''))
+        model_name = get_model_name(sha256, session, self.sha_to_name_manifests)
         if sha256:
             base_tags['model_sha256'] = self._escape_tag_value(sha256[:16])  # Первые 16 символов
         if model_name and model_name != 'N/A':
             base_tags['model'] = self._escape_tag_value(model_name)
         
-        # PID и session_id
+        # PID и session_id (уникальный на основе времени старта + PID)
         pid = session.get('pid')
         if pid:
             base_tags['pid'] = self._escape_tag_value(str(pid))
-            base_tags['session_id'] = self._escape_tag_value(f"session_{pid}")
+            # Создаем уникальный session_id для каждой реальной сессии (как в парсере)
+            start_time = session.get('start_time', '')
+            if start_time:
+                # Используем полное время старта для уникальности каждой сессии
+                start_time_clean = start_time.replace(':', '').replace('-', '').replace('+', '').replace('T', '_').replace('.', '')
+                base_tags['session_id'] = self._escape_tag_value(f"session_{pid}_{start_time_clean}")
+            else:
+                base_tags['session_id'] = self._escape_tag_value(f"session_{pid}")
         
         # GPU информация
         offload_info = session.get('offload_info', {})
@@ -309,7 +364,11 @@ class OllamaInfluxDBWriter:
                 req_fields['latency_seconds'] = latency
             
             # Время запроса
-            req_timestamp_ns = self._parse_timestamp(req.get('journal_time', start_time))
+            journal_time = req.get('journal_time')
+            if not journal_time:
+                req_timestamp_ns = self._parse_timestamp(start_time)
+            else:
+                req_timestamp_ns = self._parse_timestamp(journal_time)
             
             if req_fields:
                 req_tags_str = ','.join([f'{k}={v}' for k, v in req_tags.items()])
