@@ -363,12 +363,33 @@ class OllamaInfluxDBWriter:
             if latency:
                 req_fields['latency_seconds'] = latency
             
-            # Время запроса
+            # Время запроса - вычисляем время НАЧАЛА запроса
             journal_time = req.get('journal_time')
             if not journal_time:
                 req_timestamp_ns = self._parse_timestamp(start_time)
             else:
-                req_timestamp_ns = self._parse_timestamp(journal_time)
+                # Время завершения запроса
+                end_timestamp_ns = self._parse_timestamp(journal_time)
+                
+                # Вычисляем время начала запроса (завершение - длительность)
+                if latency and latency > 0:
+                    # Конвертируем latency в наносекунды и вычитаем из времени завершения
+                    latency_ns = int(latency * 1_000_000_000)
+                    calculated_start_ns = end_timestamp_ns - latency_ns
+                    
+                    # ВАЖНО: запрос не может начаться раньше готовности модели
+                    # Время готовности модели = start_time + loading_duration
+                    model_ready_ns = timestamp_ns  # start_time сессии
+                    loading_duration = self._parse_duration(session.get('runner_start_time', ''))
+                    if loading_duration:
+                        loading_duration_ns = int(loading_duration * 1_000_000_000)
+                        model_ready_ns = timestamp_ns + loading_duration_ns
+                    
+                    # Время начала запроса = max(вычисленное время, время готовности модели)
+                    req_timestamp_ns = max(calculated_start_ns, model_ready_ns)
+                else:
+                    # Если нет latency, используем время завершения
+                    req_timestamp_ns = end_timestamp_ns
             
             if req_fields:
                 req_tags_str = ','.join([f'{k}={v}' for k, v in req_tags.items()])
