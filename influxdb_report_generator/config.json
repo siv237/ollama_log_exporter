@@ -1,0 +1,12 @@
+{
+  "influxdb": {
+    "url": "http://192.168.237.198:8086",
+    "token": "2AIHzQk-eNuLFbRy8VjqaBs7fJGcEgAHO44fgbZun7h4yKZaOGgNkD38xo2ppnOvp6p9OIpdl9w1dV6NFzyiwA==",
+    "org": "ollama-monitoring",
+    "bucket": "ollama-logs"
+  },
+  "report": {
+    "output_dir": "reports",
+    "time_range": "24h"
+  }
+}
