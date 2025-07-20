@@ -254,6 +254,11 @@ def parse_log(log_file, sha_to_name=None):
                 time_str = line.split(' in ')[-1].split(' seconds')[0]
                 current_session['runner_start_time'] = f"{time_str} s"
             runner_block_lines -= 1
+        
+        # Ищем "llama runner started" во всей сессии, не только в runner_block
+        if 'msg="llama runner started' in line and 'runner_start_time' not in current_session:
+            time_str = line.split(' in ')[-1].split(' seconds')[0]
+            current_session['runner_start_time'] = f"{time_str} s"
         # --- вне блока runner'а не извлекаем параметры ---
     if current_session and (
         current_session.get('sha256') or current_session.get('offload_info') or current_session.get('model_name') or current_session.get('model_sha256')
