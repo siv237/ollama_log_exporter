@@ -142,11 +142,9 @@ def parse_log(log_file, sha_to_name=None):
         m_pid = re.search(r'ollama\[(\d+)\]', line)
         pid = m_pid.group(1) if m_pid else None
         is_new_session = False
-        # Новая сессия только по runner, VRAM loading или смене PID одновременно с этими событиями
-        if (
-            'msg="starting llama server"' in line or
-            'msg="new model will fit in available VRAM in single GPU, loading"' in line
-        ):
+        # Новая сессия только по событию "starting llama server"
+        # "new model will fit" - это подготовка к загрузке, но не новая сессия
+        if 'msg="starting llama server"' in line:
             is_new_session = True
         if is_new_session:
             if current_session and (

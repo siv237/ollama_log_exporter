@@ -238,6 +238,39 @@ class OllamaInfluxDBIntegration:
         
         return requests
     
+    def parse_unloading_events(self) -> list:
+        """Парсит события выгрузки моделей из логов."""
+        unloading_events = []
+        
+        # Паттерн для событий "gpu VRAM usage didn't recover within timeout"
+        vram_pattern = re.compile(
+            r'^([\d\-:T\+]+)\s+[^:]+:\s+.*msg="gpu VRAM usage didn\'t recover within timeout"\s+'
+            r'seconds=([\d\.]+)\s+model=([^\s]+)'
+        )
+        
+        with open(self.dump_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                match = vram_pattern.search(line)
+                if match:
+                    journal_time = match.group(1).strip()
+                    timeout_seconds = float(match.group(2))
+                    model_path = match.group(3).strip()
+                    
+                    # Извлекаем SHA256 из пути модели
+                    sha256 = None
+                    if 'sha256-' in model_path:
+                        sha256 = model_path.split('sha256-')[-1]
+                    
+                    unloading_events.append({
+                        'journal_time': journal_time,
+                        'timeout_seconds': timeout_seconds,
+                        'model_path': model_path,
+                        'sha256': sha256,
+                        'event_type': 'vram_timeout'
+                    })
+        
+        return unloading_events
+    
     def assign_requests_to_sessions(self, sessions: list, requests: list) -> list:
         """Привязывает API запросы к сессиям по времени."""
         # Преобразуем время сессий в datetime
@@ -299,11 +332,15 @@ class OllamaInfluxDBIntegration:
         print("  - Привязка запросов к сессиям...")
         sessions = self.assign_requests_to_sessions(sessions, gin_requests)
         
-        print(f"  ✅ Собрано: {len(sessions)} сессий, {len(gin_requests)} запросов")
+        # 5. Парсим события выгрузки моделей
+        print("  - Парсинг событий выгрузки...")
+        unloading_events = self.parse_unloading_events()
         
-        return sessions, [], [], []
+        print(f"  ✅ Собрано: {len(sessions)} сессий, {len(gin_requests)} запросов, {len(unloading_events)} выгрузок")
+        
+        return sessions, [], unloading_events, []
     
-    def write_to_influxdb(self, sessions: list, systemd_events: list, ollama_events: list) -> bool:
+    def write_to_influxdb(self, sessions: list, systemd_events: list, ollama_events: list, unloading_events: list = None) -> bool:
         """Записывает данные в InfluxDB."""
         print("Запись данных в InfluxDB...")
         
@@ -321,16 +358,22 @@ class OllamaInfluxDBIntegration:
             if not self.writer.write_system_events(systemd_events, ollama_events):
                 success = False
         
+        # Записываем события выгрузки
+        if unloading_events:
+            print(f"  - Запись {len(unloading_events)} событий выгрузки...")
+            if not self.writer.write_unloading_events(unloading_events, sessions):
+                success = False
+        
         return success
     
     def run_once(self) -> bool:
         """Выполняет один цикл сбора и записи данных."""
         try:
             # Собираем данные
-            sessions, systemd_events, ollama_events, models = self.collect_log_data()
-            
+            sessions, systemd_events, unloading_events, models = self.collect_log_data()
+        
             # Записываем в InfluxDB
-            success = self.write_to_influxdb(sessions, systemd_events, ollama_events)
+            success = self.write_to_influxdb(sessions, systemd_events, [], unloading_events)
             
             if success:
                 print("✅ Цикл интеграции завершен успешно")
@@ -358,15 +401,15 @@ class OllamaInfluxDBIntegration:
                 
                 if first_run:
                     print("🚀 Первый запуск - полный парсинг всех логов")
-                    sessions, systemd_events, ollama_events, models = self.collect_log_data(incremental=False)
+                    sessions, systemd_events, unloading_events, models = self.collect_log_data(incremental=False)
                     first_run = False
                 else:
                     print("⚡ Инкрементальный парсинг новых логов")
-                    sessions, systemd_events, ollama_events, models = self.collect_log_data(incremental=True)
+                    sessions, systemd_events, unloading_events, models = self.collect_log_data(incremental=True)
                 
                 # Записываем в InfluxDB только если есть данные
-                if sessions or systemd_events or ollama_events:
-                    success = self.write_to_influxdb(sessions, systemd_events, ollama_events)
+                if sessions or systemd_events or unloading_events:
+                    success = self.write_to_influxdb(sessions, systemd_events, [], unloading_events)
                     if success:
                         print("✅ Цикл интеграции завершен успешно")
                     else:

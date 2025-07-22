@@ -521,6 +521,122 @@ class OllamaInfluxDBWriter:
         except Exception as e:
             print(f"Ошибка при записи системных событий в InfluxDB: {e}")
             return False
+    
+    def write_unloading_events(self, unloading_events: List[Dict], sessions: List[Dict] = None) -> bool:
+        """Записывает события выгрузки моделей в InfluxDB, привязывая их к сессиям."""
+        if not unloading_events:
+            return True
+            
+        points = []
+        
+        # Создаем карту сессий по SHA256 и времени для быстрого поиска
+        session_map = {}
+        if sessions:
+            for session in sessions:
+                sha256 = session.get('sha256', session.get('model_sha256', ''))
+                if sha256:
+                    start_time = session.get('start_time')
+                    if start_time:
+                        session_map[sha256] = session
+        
+        for event in unloading_events:
+            timestamp_ns = self._parse_timestamp(event.get('journal_time', ''))
+            
+            # Определяем название модели
+            sha256 = event.get('sha256', '')
+            model_name = get_model_name(sha256, None, self.sha_to_name_manifests)
+            
+            # Ищем соответствующую активную сессию
+            matched_session = None
+            if sha256 and sessions:
+                # Ищем активную сессию с тем же SHA256
+                event_time = self._parse_timestamp(event.get('journal_time', ''))
+                
+                # Сортируем сессии по времени старта
+                sorted_sessions = sorted(sessions, key=lambda s: self._parse_timestamp(s.get('start_time', '')))
+                
+                for i, session in enumerate(sorted_sessions):
+                    session_sha256 = session.get('sha256', session.get('model_sha256', ''))
+                    if session_sha256 == sha256:
+                        session_start = self._parse_timestamp(session.get('start_time', ''))
+                        
+                        # Определяем конец сессии
+                        session_end = None
+                        if i + 1 < len(sorted_sessions):
+                            # Конец сессии = начало следующей сессии
+                            session_end = self._parse_timestamp(sorted_sessions[i + 1].get('start_time', ''))
+                        
+                        # Проверяем что событие выгрузки происходит в диапазоне сессии
+                        if session_start and event_time and event_time >= session_start:
+                            if session_end is None or event_time <= session_end:
+                                matched_session = session
+                                break
+        
+            # Базовые теги
+            tags = {
+                'event_type': self._escape_tag_value(event.get('event_type', 'unloading')),
+                'model': self._escape_tag_value(model_name),
+                'model_sha256': self._escape_tag_value(sha256[:16] if sha256 else 'unknown')
+            }
+            
+            # Если нашли сессию - добавляем её данные
+            if matched_session:
+                pid = matched_session.get('pid')
+                if pid:
+                    tags['pid'] = self._escape_tag_value(str(pid))
+                    # Создаем тот же session_id что и для сессии
+                    start_time = matched_session.get('start_time', '')
+                    if start_time:
+                        start_time_clean = start_time.replace(':', '').replace('-', '').replace('+', '').replace('T', '_').replace('.', '')
+                        tags['session_id'] = self._escape_tag_value(f"session_{pid}_{start_time_clean}")
+                    else:
+                        tags['session_id'] = self._escape_tag_value(f"session_{pid}")
+                
+                # GPU информация
+                offload_info = matched_session.get('offload_info', {})
+                if offload_info.get('library'):
+                    tags['gpu_library'] = self._escape_tag_value(offload_info['library'])
+            
+            fields = {
+                'timeout_seconds': event.get('timeout_seconds', 0.0),
+                'model_path': event.get('model_path', '')
+            }
+            
+            tags_str = ','.join([f'{k}={v}' for k, v in tags.items()])
+            fields_str = ','.join([f'{k}={self._escape_field_value(v)}' for k, v in fields.items()])
+            points.append(f"ollama_unloading,{tags_str} {fields_str} {timestamp_ns}")
+        
+        if not points:
+            return True
+        
+        # Отправляем в InfluxDB
+        line_protocol_data = '\n'.join(points)
+        
+        try:
+            params = {
+                'org': self.org,
+                'bucket': self.bucket,
+                'precision': 'ns'
+            }
+            
+            response = requests.post(
+                self.write_url,
+                headers=self.headers,
+                params=params,
+                data=line_protocol_data,
+                timeout=30
+            )
+            
+            if response.status_code == 204:
+                print(f"Успешно записано {len(points)} событий выгрузки в InfluxDB")
+                return True
+            else:
+                print(f"Ошибка записи событий выгрузки в InfluxDB: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"Ошибка при записи событий выгрузки в InfluxDB: {e}")
+            return False
 
 
 def main():
